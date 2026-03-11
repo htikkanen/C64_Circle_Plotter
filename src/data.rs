@@ -1,4 +1,5 @@
-#![allow(dead_code)]
+use std::sync::LazyLock;
+
 // Static data tables for the C64 Circle Plotter visualizer.
 // Ported from the original JavaScript source.
 
@@ -14,10 +15,20 @@ pub const SPRITE_H: usize = 21;
 pub const MUX_H: usize = 21;
 pub const MAX_SPR_LINE: usize = 8;
 pub const FPS: f64 = 50.0;
+#[allow(dead_code)]
 pub const SPR_CX: usize = 8;
+#[allow(dead_code)]
 pub const SPR_CY: usize = 7;
 pub const EMPTY_IDX: u8 = 2;
 pub const TOTAL_FRAMES: usize = 304;
+
+pub const FADE_CUTOFF: f64 = 0.85;
+
+// Animation phase boundaries
+pub const P1_END: usize = 64;
+pub const P2_END: usize = 128;
+pub const P3_END: usize = 256;
+pub const P4_END: usize = 304;
 
 /// 256 characters, each 8 bytes (8x8 bitmap).
 pub static CHARSET: [[u8; 8]; 256] = [
@@ -318,10 +329,10 @@ impl StampCell {
     }
 }
 
-/// Returns the 64-entry stamp lookup table.
+/// The 64-entry stamp lookup table.
 /// Each entry is a list of `StampCell`s describing which character tiles
 /// to place at which offsets.
-pub fn stamps() -> Vec<Vec<StampCell>> {
+pub static STAMPS_TABLE: LazyLock<Vec<Vec<StampCell>>> = LazyLock::new(|| {
     vec![
         // Entry 0
         vec![
@@ -692,11 +703,11 @@ pub fn stamps() -> Vec<Vec<StampCell>> {
             StampCell::new(2, 0, 2), StampCell::new(2, 1, 255), StampCell::new(2, 2, 43),
         ],
     ]
-}
+});
 
-/// Pre-expand the sprite bitmap into a pixel array.
+/// Pre-expanded sprite bitmap as a pixel array (lazily computed once).
 /// Each entry is 1 (set) or 0 (clear), row-major order.
-pub fn compute_spr_pixels() -> [u8; SPRITE_W * SPRITE_H] {
+pub static SPR_PIXELS: LazyLock<[u8; SPRITE_W * SPRITE_H]> = LazyLock::new(|| {
     let mut pixels = [0u8; SPRITE_W * SPRITE_H];
     for row in 0..SPRITE_H {
         for byte_col in 0..3 {
@@ -709,11 +720,11 @@ pub fn compute_spr_pixels() -> [u8; SPRITE_W * SPRITE_H] {
         }
     }
     pixels
-}
+});
 
-/// Pre-expand all 256 charset characters into pixel arrays.
+/// Pre-expanded charset characters as pixel arrays (lazily computed once).
 /// Each character produces 64 pixels (8x8), row-major, with values 1 or 0.
-pub fn compute_char_pixels() -> [[u8; 64]; 256] {
+pub static CHAR_PIXELS: LazyLock<[[u8; 64]; 256]> = LazyLock::new(|| {
     let mut all = [[0u8; 64]; 256];
     for ch in 0..256 {
         for row in 0..8 {
@@ -726,4 +737,5 @@ pub fn compute_char_pixels() -> [[u8; 64]; 256] {
         }
     }
     all
-}
+});
+

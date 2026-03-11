@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -69,10 +68,6 @@ const CY: f64 = 100.0;
 const GEO_R: f64 = 85.0;
 const GEO_DIST: f64 = 400.0;
 const F_END: f64 = 256.0;
-const FADE_CUTOFF: f64 = 0.85;
-
-const C64W: f64 = 320.0;
-const C64H_F: f64 = 200.0;
 
 // ---------------------------------------------------------------------------
 // FONT definition
@@ -170,6 +165,14 @@ struct GeoData {
     verts_h: Vec<Vert>,
     letter_ranges: Vec<LetterRange>,
     n_verts: usize,
+    #[allow(dead_code)]
+    mid_vy: f64,
+    #[allow(dead_code)]
+    mid_hx: f64,
+    e_vert_y: f64,
+    d_vert_y: f64,
+    e_vert_x: f64,
+    d_vert_x: f64,
 }
 
 fn build_geo_data() -> GeoData {
@@ -309,11 +312,27 @@ fn build_geo_data() -> GeoData {
     }
 
     let n_verts = verts_v.len();
+
+    let cell = 0.0595_f64;
+    let mid_vy_val = (ly - 3 + 6) as f64 / 2.0;
+    let total_w = 47.0_f64;
+    let mid_hx_val = (total_w - 1.0) / 2.0;
+    let e_vert_y = (3.0 - mid_vy_val) * cell;
+    let d_vert_y = (53.0 - mid_vy_val) * cell;
+    let e_vert_x = (0.0 + 3.0 - mid_hx_val) * cell;
+    let d_vert_x = (40.0 + 3.0 - mid_hx_val) * cell;
+
     GeoData {
         verts_v,
         verts_h,
         letter_ranges,
         n_verts,
+        mid_vy: mid_vy_val,
+        mid_hx: mid_hx_val,
+        e_vert_y,
+        d_vert_y,
+        e_vert_x,
+        d_vert_x,
     }
 }
 
@@ -323,6 +342,7 @@ static GEO: LazyLock<GeoData> = LazyLock::new(build_geo_data);
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub fn should_skip(z: f64) -> bool {
     z > FADE_CUTOFF
 }
@@ -350,7 +370,7 @@ pub fn get_stamp_cells(px: f64, py: f64) -> Vec<StampCellPos> {
     let xs = ((pxi % 8) + 8) % 8;
     let ys = ((pyi % 8) + 8) % 8;
     let stamp_idx = (ys * 8 + xs) as usize;
-    let all_stamps = stamps(); // from crate::data
+    let all_stamps = &*STAMPS_TABLE;
     let stamp = &all_stamps[stamp_idx];
 
     // JS:  const br=Math.floor(py/8)-1, bc=Math.floor(px/8)-1;
@@ -385,10 +405,6 @@ pub fn gen_positions(f: usize) -> FramePositions {
 
     let ff = f as f64;
 
-    const P1_END: usize = 64;
-    const P2_END: usize = 128;
-    const P3_END: usize = 256;
-    const P4_END: usize = 304;
     const TRAIL_LIFE: f64 = 12.0;
     const EXIT_FRAMES: f64 = 48.0;
 
@@ -405,24 +421,10 @@ pub fn gen_positions(f: usize) -> FramePositions {
         0.0
     };
 
-    // _midVY — computed the same way as build_geo_data
-    let font = font_data();
-    let mut ly: i32 = 0;
-    for ch in LOGO.chars() {
-        ly += font[&ch].len() as i32 + 3;
-    }
-    let mid_vy = (ly - 3 + 6) as f64 / 2.0;
-
-    let e_vert_y = (3.0 - mid_vy) * CELL;
-    // D is the last letter. Its row_offset in vertical layout:
-    // E(7)+3 + X(7)+3 + T(7)+3 + E(7)+3 + N(7)+3 = 5*(7+3) = 50, so D starts at row 50.
-    // d_vert_y = (50 + 3 - mid_vy) * CELL = (53 - mid_vy) * CELL
-    let d_vert_y = (53.0 - mid_vy) * CELL;
-
-    let total_w: f64 = 47.0;
-    let mid_hx = (total_w - 1.0) / 2.0;
-    let e_vert_x = (0.0 + 3.0 - mid_hx) * CELL;
-    let d_vert_x = (40.0 + 3.0 - mid_hx) * CELL;
+    let e_vert_y = geo.e_vert_y;
+    let d_vert_y = geo.d_vert_y;
+    let e_vert_x = geo.e_vert_x;
+    let d_vert_x = geo.d_vert_x;
 
     // Camera parameters
     let zoom_factor: f64;
@@ -739,7 +741,7 @@ pub fn gen_positions(f: usize) -> FramePositions {
                 let cur_x = fin_x + rdx / dist * fly_dist;
                 let cur_y = fin_y + rdy / dist * fly_dist;
 
-                if cur_x < -60.0 || cur_x > C64W + 60.0 || cur_y < -60.0 || cur_y > C64H_F + 60.0
+                if cur_x < -60.0 || cur_x > C64W as f64 + 60.0 || cur_y < -60.0 || cur_y > C64H as f64 + 60.0
                 {
                     continue;
                 }
@@ -776,9 +778,9 @@ pub fn gen_positions(f: usize) -> FramePositions {
             // Normal on-screen check
             let margin = 40.0;
             let on_screen = fin_x > -margin
-                && fin_x < C64W + margin
+                && fin_x < C64W as f64 + margin
                 && fin_y > -margin
-                && fin_y < C64H_F + margin;
+                && fin_y < C64H as f64 + margin;
             if !on_screen {
                 continue;
             }
@@ -839,7 +841,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     if positions.is_empty() {
         return AllocResult {
             asgn: Vec::new(),
-            sl_counts: vec![0u8; C64H_F as usize],
+            sl_counts: vec![0u8; C64H],
             max_sl: 0,
             mux_overflows: 0,
             mux_used: 0,
@@ -852,27 +854,25 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     let mut vis: Vec<DiscPosition> = Vec::new();
     let mut vis_idx: Vec<usize> = Vec::new();
     let mut force_sprite: Vec<bool> = Vec::new();
+    let mut stamp_data: Vec<Vec<StampCellPos>> = Vec::new();
 
     for (i, p) in positions.iter().enumerate() {
-        if p.x >= -12.0 && p.x < C64W + 12.0 && p.y >= -12.0 && p.y < C64H_F + 12.0 {
+        if p.x >= -12.0 && p.x < C64W as f64 + 12.0 && p.y >= -12.0 && p.y < C64H as f64 + 12.0 {
             let cells = get_stamp_cells(p.x, p.y);
-            let near_edge = p.y < 12.0 || p.y > C64H_F - 12.0 || p.x < 12.0 || p.x > C64W - 12.0;
+            let near_edge = p.y < 12.0 || p.y > C64H as f64 - 12.0 || p.x < 12.0 || p.x > C64W as f64 - 12.0;
             if !cells.is_empty() {
                 vis.push(p.clone());
                 vis_idx.push(i);
                 force_sprite.push(near_edge && cells.len() <= 2);
+                stamp_data.push(cells);
             } else if near_edge {
                 vis.push(p.clone());
                 vis_idx.push(i);
                 force_sprite.push(true);
+                stamp_data.push(cells); // empty vec
             }
         }
     }
-
-    let mut stamp_data: Vec<Vec<StampCellPos>> = vis
-        .iter()
-        .map(|p| get_stamp_cells(p.x, p.y))
-        .collect();
 
     let vis_len = vis.len();
     let mut mode: Vec<DiscMode> = vec![DiscMode::Char; vis_len];
@@ -893,14 +893,13 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
 
     // Build conflicts helper
     let build_conflicts = |mode: &[DiscMode], stamp_data: &[Vec<StampCellPos>]| -> Vec<u16> {
-        let mut cell_owners: HashMap<i32, Vec<usize>> = HashMap::new();
+        let mut cell_owners: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for i in 0..vis_len {
             if mode[i] != DiscMode::Char {
                 continue;
             }
             for s in &stamp_data[i] {
-                let k = s.row * 100 + s.col;
-                cell_owners.entry(k).or_default().push(i);
+                cell_owners.entry((s.row, s.col)).or_default().push(i);
             }
         }
         let mut cc = vec![0u16; vis_len];
@@ -966,14 +965,13 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
             let mut improved = false;
 
             // Build cell owner map for char-mode discs
-            let mut co: HashMap<i32, Vec<usize>> = HashMap::new();
+            let mut co: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
             for i in 0..vis_len {
                 if mode[i] != DiscMode::Char {
                     continue;
                 }
                 for s in &stamp_data[i] {
-                    let k = s.row * 100 + s.col;
-                    co.entry(k).or_default().push(i);
+                    co.entry((s.row, s.col)).or_default().push(i);
                 }
             }
 
@@ -996,8 +994,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                 // Count current conflicts for this disc
                 let mut cur = 0i32;
                 for s in &stamp_data[di] {
-                    let k = s.row * 100 + s.col;
-                    if let Some(o) = co.get(&k) {
+                    if let Some(o) = co.get(&(s.row, s.col)) {
                         if o.len() > 1 {
                             cur += 1;
                         }
@@ -1020,8 +1017,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                     }
                     let mut nc = 0i32;
                     for s in &ns {
-                        let k = s.row * 100 + s.col;
-                        if let Some(o) = co.get(&k) {
+                        if let Some(o) = co.get(&(s.row, s.col)) {
                             let oc = o.iter().filter(|&&x| x != di).count();
                             if oc > 0 {
                                 nc += 1;
@@ -1039,8 +1035,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                     if best_c < cur {
                         // Remove old stamp entries from co
                         for s in &stamp_data[di] {
-                            let k = s.row * 100 + s.col;
-                            if let Some(o) = co.get_mut(&k) {
+                            if let Some(o) = co.get_mut(&(s.row, s.col)) {
                                 if let Some(idx) = o.iter().position(|&x| x == di) {
                                     o.remove(idx);
                                 }
@@ -1052,8 +1047,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                         stamp_data[di] = new_stamp.clone();
                         // Add new stamp entries to co
                         for s in &new_stamp {
-                            let k = s.row * 100 + s.col;
-                            co.entry(k).or_default().push(di);
+                            co.entry((s.row, s.col)).or_default().push(di);
                         }
                         improved = true;
                     }
@@ -1092,14 +1086,13 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     // Count char conflicts
     let mut char_conflicts: u32 = 0;
     {
-        let mut cm: HashMap<i32, Vec<usize>> = HashMap::new();
+        let mut cm: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for (i, a) in asgn.iter().enumerate() {
             if a.mode != DiscMode::Char {
                 continue;
             }
             for s in &a.stamp {
-                let k = s.row * 100 + s.col;
-                cm.entry(k).or_default().push(i);
+                cm.entry((s.row, s.col)).or_default().push(i);
             }
         }
         for owners in cm.values() {
@@ -1113,8 +1106,6 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     struct SpriteInfo {
         idx: usize,
         top_y: i32,
-        #[allow(dead_code)]
-        end_y: i32,
     }
 
     let mut sprite_infos: Vec<SpriteInfo> = Vec::new();
@@ -1126,7 +1117,6 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
         sprite_infos.push(SpriteInfo {
             idx: ai,
             top_y,
-            end_y: top_y + MUX_H as i32,
         });
     }
     sprite_infos.sort_by_key(|si| si.top_y);
@@ -1147,7 +1137,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     }
 
     // Build sl_counts
-    let c64h = C64H_F as usize;
+    let c64h = C64H;
     let mut sl_counts = vec![0u8; c64h];
     for si in &sprite_infos {
         if sprite_slot_lookup.get(&si.idx).is_none() {

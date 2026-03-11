@@ -15,8 +15,6 @@ const COL_S_PURPLE: [u8; 3] = [100, 130, 180];
 const COL_S_BLUE: [u8; 3] = [60, 60, 200];
 const COL_S_DKBLUE: [u8; 3] = [20, 20, 120];
 
-const FADE_CUTOFF: f64 = 0.85;
-
 /// Dark-to-bright shade ramp for depth-based coloring.
 const SHADE_RAMP: [[u8; 3]; 7] = [
     [8, 10, 50],    // darkest
@@ -118,25 +116,7 @@ pub fn disc_color(a: &Assignment, glitch_color_active: bool, glitch_frame: usize
         }
     };
 
-    // Clamp index (base_idx is already an integer so frac is always 0,
-    // but we follow the JS structure exactly for correctness)
-    let idx = base_idx.min(SHADE_RAMP.len() - 1);
-    let lo = idx;
-    let hi = (lo + 1).min(SHADE_RAMP.len() - 1);
-    let frac = 0.0_f64; // idx - lo is always 0 since idx is integer
-    let clo = SHADE_RAMP[lo];
-    let chi = SHADE_RAMP[hi];
-    [
-        (clo[0] as f64 + (chi[0] as f64 - clo[0] as f64) * frac).round() as u8,
-        (clo[1] as f64 + (chi[1] as f64 - clo[1] as f64) * frac).round() as u8,
-        (clo[2] as f64 + (chi[2] as f64 - clo[2] as f64) * frac).round() as u8,
-    ]
-}
-
-/// Returns true if the disc should be culled (back-face).
-#[inline]
-fn should_skip(z: f64) -> bool {
-    z > FADE_CUTOFF
+    SHADE_RAMP[base_idx.min(SHADE_RAMP.len() - 1)]
 }
 
 // ============================================================
@@ -150,7 +130,6 @@ fn should_skip(z: f64) -> bool {
 ///   - `FrameStats`: statistics for the frame
 ///   - `Vec<u8>`: scanline counts for scanline visualisation (length C64H)
 pub fn render_frame(
-    _frame: usize,
     frame_positions: &FramePositions,
     spr_pixels: &[u8],
     char_pixels: &[[u8; 64]; 256],

@@ -32,7 +32,14 @@ struct C64App {
 }
 
 impl C64App {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.visuals.dark_mode = true;
+        style.visuals.panel_fill = COL_BG;
+        style.visuals.window_fill = COL_PANEL;
+        style.visuals.widgets.noninteractive.bg_fill = COL_PANEL;
+        style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, COL_TEXT);
+        cc.egui_ctx.set_style(style);
         Self {
             frame: 0,
             playing: true,
@@ -42,8 +49,8 @@ impl C64App {
             last_corrupt_frame: None,
             accum_mem_bytes: 0,
             peak_frame_bytes: 0,
-            spr_pixels: data::compute_spr_pixels(),
-            char_pixels: data::compute_char_pixels(),
+            spr_pixels: *data::SPR_PIXELS,
+            char_pixels: *data::CHAR_PIXELS,
             texture: None,
             last_stats: None,
             last_sl_counts: vec![0u8; data::C64H],
@@ -81,7 +88,6 @@ impl C64App {
 
         let positions = sim::gen_positions(self.frame);
         let (pixels, stats, sl_counts) = render::render_frame(
-            self.frame,
             &positions,
             &self.spr_pixels,
             &self.char_pixels,
@@ -105,15 +111,12 @@ impl C64App {
 }
 
 // ---------------------------------------------------------------------------
-// Color helpers
+// Color constants
 // ---------------------------------------------------------------------------
-fn hex_color(hex: &str) -> egui::Color32 {
-    let hex = hex.trim_start_matches('#');
-    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
-    egui::Color32::from_rgb(r, g, b)
-}
+const COL_PHASE_1: egui::Color32 = egui::Color32::from_rgb(0x44, 0x33, 0x55);
+const COL_PHASE_2: egui::Color32 = egui::Color32::from_rgb(0x33, 0x55, 0x44);
+const COL_PHASE_3: egui::Color32 = egui::Color32::from_rgb(0x33, 0x44, 0x55);
+const COL_PHASE_4: egui::Color32 = egui::Color32::from_rgb(0x55, 0x33, 0x44);
 
 // Theme colors
 const COL_BG: egui::Color32 = egui::Color32::from_rgb(0x0a, 0x0a, 0x0e);
@@ -166,16 +169,6 @@ impl eframe::App for C64App {
                 self.texture = Some(ctx.load_texture("c64_screen", color_image, tex_opts));
             }
         }
-
-        // --- Apply dark theme styling ---
-        let mut style = (*ctx.style()).clone();
-        style.visuals.dark_mode = true;
-        style.visuals.panel_fill = COL_BG;
-        style.visuals.window_fill = COL_PANEL;
-        style.visuals.widgets.noninteractive.bg_fill = COL_PANEL;
-        style.visuals.widgets.noninteractive.fg_stroke =
-            egui::Stroke::new(1.0, COL_TEXT);
-        ctx.set_style(style);
 
         // --- Top panel: header ---
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -309,11 +302,11 @@ impl C64App {
         let rect = response.rect;
 
         // Phase segments
-        let phases: &[(usize, usize, &str, &str)] = &[
-            (0, 64, "#443355", "E zooms in"),
-            (64, 128, "#335544", "XTEND appears"),
-            (128, 256, "#334455", "E->D pan"),
-            (256, 304, "#553344", "exit"),
+        let phases: &[(usize, usize, egui::Color32, &str)] = &[
+            (0, data::P1_END, COL_PHASE_1, "E zooms in"),
+            (data::P1_END, data::P2_END, COL_PHASE_2, "XTEND appears"),
+            (data::P2_END, data::P3_END, COL_PHASE_3, "E->D pan"),
+            (data::P3_END, data::P4_END, COL_PHASE_4, "exit"),
         ];
 
         for &(s, e, color, label) in phases {
@@ -323,7 +316,7 @@ impl C64App {
                 egui::pos2(x0, rect.top()),
                 egui::pos2(x1, rect.bottom()),
             );
-            painter.rect_filled(phase_rect, 0.0, hex_color(color));
+            painter.rect_filled(phase_rect, 0.0, color);
             painter.text(
                 phase_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -556,13 +549,13 @@ fn option_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) {
 }
 
 fn phase_label(frame: usize) -> &'static str {
-    if frame < 64 {
+    if frame < data::P1_END {
         "E zooms in"
-    } else if frame < 128 {
+    } else if frame < data::P2_END {
         "XTEND appears"
-    } else if frame < 256 {
+    } else if frame < data::P3_END {
         "E -> D pan"
-    } else if frame < 304 {
+    } else if frame < data::P4_END {
         "exit"
     } else {
         "--"
