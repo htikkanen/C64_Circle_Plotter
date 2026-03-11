@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>C64 Circle FX — Generic Allocator</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Mono:wght@400;700&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#0a0a0e;color:#c0c0d0;font-family:'JetBrains Mono',monospace;min-height:100vh}
+  .app{display:grid;grid-template-columns:1fr 300px;grid-template-rows:auto 1fr;height:100vh}
+  header{grid-column:1/-1;padding:10px 20px;background:#14141a;border-bottom:1px solid #252530;display:flex;align-items:center;gap:16px}
+  header h1{font-family:'Space Mono',monospace;font-size:13px;font-weight:700;color:#6c6cff;letter-spacing:2px;text-transform:uppercase}
+  .badge{font-size:10px;padding:2px 8px;border-radius:3px;background:#1a1a2e;border:1px solid #333355;color:#8888bb}
+  .main-view{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;background:#0c0c10}
+  .screen-wrapper{position:relative;border:2px solid #252530;border-radius:4px;box-shadow:0 0 40px rgba(80,80,255,0.06),inset 0 0 60px rgba(0,0,0,0.5);background:#000;line-height:0}
+  canvas#mainCanvas{display:block;image-rendering:pixelated}
+  .controls-bar{display:flex;align-items:center;gap:10px;margin-top:12px;padding:6px 14px;background:#111118;border:1px solid #222233;border-radius:6px;flex-wrap:wrap}
+  .btn{font-family:'JetBrains Mono',monospace;font-size:11px;padding:5px 12px;border:1px solid #333355;background:#1a1a2e;color:#aac;border-radius:4px;cursor:pointer;transition:all .15s}
+  .btn:hover{background:#252545;border-color:#5555aa;color:#cce}
+  .btn.active{background:#2a2a5a;border-color:#6c6cff;color:#fff}
+  .speed-control{display:flex;align-items:center;gap:5px;font-size:11px;color:#668}
+  .speed-control input[type="range"]{width:70px;accent-color:#6c6cff}
+  .frame-display{font-size:12px;color:#6c6cff;font-weight:600;min-width:110px;text-align:center}
+  .timeline{width:100%;max-width:644px;height:32px;margin-top:6px;cursor:pointer}
+  canvas#timelineCanvas{width:100%;height:100%;border-radius:4px;border:1px solid #1a1a25}
+  .phase-label{font-size:10px;color:#557;text-align:center;margin-top:3px}
+  .sidebar{background:#0e0e14;border-left:1px solid #1a1a25;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:12px}
+  .panel{background:#111118;border:1px solid #1e1e2a;border-radius:6px;overflow:hidden}
+  .panel-header{padding:6px 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:#557;background:#141420;border-bottom:1px solid #1e1e2a}
+  .panel-body{padding:10px;font-size:11px;line-height:1.6}
+  .stat-row{display:flex;justify-content:space-between;padding:2px 0}
+  .stat-label{color:#668}
+  .stat-value{color:#aac;font-weight:600}
+  .stat-value.sprite{color:#ff6b6b}
+  .stat-value.char{color:#51cf66}
+  .stat-value.warn{color:#ffd43b}
+  .stat-value.ok{color:#51cf66}
+  .legend{display:flex;flex-wrap:wrap;gap:8px}
+  .legend-item{display:flex;align-items:center;gap:4px;font-size:10px;color:#889}
+  .legend-dot{width:8px;height:8px;border-radius:50%}
+  .scanline-viz{width:100%;height:160px;background:#0a0a10;border-radius:4px;border:1px solid #1a1a25}
+  canvas#scanlineCanvas{width:100%;height:100%}
+  .options-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+  .option-btn{font-family:'JetBrains Mono',monospace;font-size:10px;padding:4px 6px;border:1px solid #223;background:#151520;color:#779;border-radius:3px;cursor:pointer;text-align:center;transition:all .15s}
+  .option-btn:hover{border-color:#446;color:#aac}
+  .option-btn.active{border-color:#6c6cff;color:#6c6cff;background:#1a1a35}
+  .sep{height:1px;background:#1a1a25;margin:3px 0}
+  ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:#0a0a10}::-webkit-scrollbar-thumb{background:#252535;border-radius:3px}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>C64 Circle FX</h1>
+    <span class="badge">Generic Allocator</span>
+    <span class="badge">EXTEND logo geosphere + E</span>
+  </header>
+  <div class="main-view">
+    <div class="screen-wrapper"><canvas id="mainCanvas" width="640" height="400"></canvas></div>
+    <div class="controls-bar">
+      <button class="btn" id="btnPlay">▶ Play</button>
+      <button class="btn" id="btnStep">⏭ Step</button>
+      <button class="btn" id="btnReset">⏮ Reset</button>
+      <div class="speed-control"><span>Spd</span><input type="range" id="speedSlider" min="0.1" max="4" step="0.1" value="1"><span id="speedLabel">1.0×</span></div>
+      <div class="frame-display" id="frameDisplay">Frame 0</div>
+      <div class="frame-display" id="corruptDisplay" style="color:#ff6b6b">Corrupt: 0</div>
+    </div>
+    <div class="timeline"><canvas id="timelineCanvas"></canvas></div>
+    <div class="phase-label" id="phaseLabel">—</div>
+  </div>
+  <div class="sidebar">
+    <div class="panel"><div class="panel-header">Legend</div><div class="panel-body"><div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#51cf66"></div>Char</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#ff6b6b"></div>Sprite</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#642020"></div>No mux slot</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#ffd43b"></div>Corruption</div>
+    </div></div></div>
+    <div class="panel"><div class="panel-header">Frame Stats</div><div class="panel-body">
+      <div class="stat-row"><span class="stat-label">Circles</span><span class="stat-value" id="statTotal">0</span></div>
+      <div class="stat-row"><span class="stat-label">Visible</span><span class="stat-value" id="statVisible">0</span></div>
+      <div class="stat-row"><span class="stat-label">As sprites</span><span class="stat-value sprite" id="statSprites">0</span></div>
+      <div class="stat-row"><span class="stat-label">As chars</span><span class="stat-value char" id="statChars">0</span></div>
+      <div class="sep"></div>
+      <div class="stat-row"><span class="stat-label">Char conflicts</span><span class="stat-value" id="statConflicts">0</span></div>
+      <div class="stat-row"><span class="stat-label">Max spr/scanline</span><span class="stat-value sprite" id="statMaxSL">0</span></div>
+      <div class="stat-row"><span class="stat-label">Mux overflows</span><span class="stat-value" id="statMuxOver">0</span></div>
+      <div class="stat-row"><span class="stat-label">Mux slots used</span><span class="stat-value sprite" id="statMuxUsed">0</span></div>
+      <div class="stat-row"><span class="stat-label">Frame discs</span><span class="stat-value" id="statMemDiscs">0</span></div>
+      <div class="stat-row"><span class="stat-label">Frame bytes</span><span class="stat-value" id="statMemBytes">0</span></div>
+      <div class="stat-row"><span class="stat-label">Total memory</span><span class="stat-value" id="statMemPeak">0</span></div>
+    </div></div>
+    <div class="panel"><div class="panel-header">Scanline Sprites</div><div class="panel-body"><div class="scanline-viz"><canvas id="scanlineCanvas"></canvas></div></div></div>
+    <div class="panel"><div class="panel-header">Display</div><div class="panel-body"><div class="options-grid">
+      <div class="option-btn" id="optGrid" onclick="tog('grid')">Grid</div>
+      <div class="option-btn active" id="optColor" onclick="tog('color')">Color code</div>
+      <div class="option-btn" id="optIds" onclick="tog('ids')">IDs</div>
+      <div class="option-btn active" id="optCorruption" onclick="tog('corruption')">Corruption</div>
+      <div class="option-btn active" id="optC64only" onclick="tog('c64only')">C64 only</div>
+      <div class="option-btn" id="optMux" onclick="tog('mux')">Mux zones</div>
+    </div></div></div>
+  </div>
+</div>
+<script>
+const CHARSET = [[3, 15, 31, 63, 127, 127, 255, 255], [192, 240, 248, 252, 254, 254, 255, 255], [0, 0, 0, 0, 0, 0, 0, 0], [1, 7, 15, 31, 63, 63, 127, 127], [240, 248, 252, 254, 254, 255, 255, 255], [0, 0, 0, 0, 0, 0, 128, 128], [0, 3, 7, 15, 31, 31, 63, 63], [248, 252, 254, 255, 255, 255, 255, 255], [0, 0, 0, 0, 0, 128, 192, 224], [0, 1, 3, 7, 15, 15, 31, 31], [252, 254, 255, 255, 255, 255, 255, 255], [0, 0, 0, 128, 192, 224, 224, 240], [0, 0, 1, 3, 7, 15, 15, 31], [60, 255, 255, 255, 255, 255, 255, 255], [0, 0, 128, 192, 224, 224, 240, 240], [0, 0, 0, 1, 3, 7, 7, 15], [63, 127, 255, 255, 255, 255, 255, 255], [0, 128, 192, 224, 240, 240, 248, 248], [0, 0, 0, 0, 0, 1, 3, 7], [31, 63, 127, 255, 255, 255, 255, 255], [0, 192, 224, 240, 248, 248, 252, 252], [0, 0, 0, 0, 0, 0, 1, 1], [15, 31, 63, 127, 127, 255, 255, 255], [128, 224, 240, 248, 252, 252, 254, 254], [255, 127, 127, 63, 31, 15, 3, 0], [255, 254, 254, 252, 248, 240, 192, 0], [127, 63, 63, 31, 15, 7, 1, 0], [255, 255, 255, 254, 252, 248, 224, 0], [128, 0, 0, 0, 0, 0, 0, 0], [63, 63, 31, 15, 7, 1, 0, 0], [255, 255, 255, 255, 254, 252, 240, 0], [192, 128, 0, 0, 0, 0, 0, 0], [31, 15, 15, 7, 3, 1, 0, 0], [255, 255, 255, 255, 255, 254, 120, 0], [224, 192, 192, 128, 0, 0, 0, 0], [15, 7, 7, 3, 1, 0, 0, 0], [255, 255, 255, 255, 255, 255, 60, 0], [240, 224, 224, 192, 128, 0, 0, 0], [7, 3, 3, 1, 0, 0, 0, 0], [255, 255, 255, 255, 255, 127, 30, 0], [240, 240, 224, 224, 192, 128, 0, 0], [3, 1, 0, 0, 0, 0, 0, 0], [255, 255, 255, 255, 127, 63, 15, 0], [252, 248, 248, 240, 224, 192, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], [255, 255, 255, 127, 63, 31, 7, 0], [254, 252, 252, 248, 240, 224, 128, 0], [0, 3, 15, 31, 63, 127, 127, 255], [0, 192, 240, 248, 252, 254, 254, 255], [0, 1, 7, 15, 31, 63, 63, 127], [0, 224, 248, 252, 254, 255, 255, 255], [0, 0, 0, 0, 0, 0, 0, 128], [0, 0, 3, 7, 15, 31, 31, 63], [0, 240, 252, 254, 255, 255, 255, 255], [0, 0, 0, 0, 0, 0, 128, 192], [0, 120, 254, 255, 255, 255, 255, 255], [0, 0, 0, 0, 128, 192, 192, 224], [0, 60, 255, 255, 255, 255, 255, 255], [0, 0, 0, 0, 1, 3, 3, 7], [0, 30, 127, 255, 255, 255, 255, 255], [0, 0, 0, 0, 0, 0, 1, 3], [0, 15, 63, 127, 255, 255, 255, 255], [0, 0, 128, 224, 240, 248, 252, 252], [0, 0, 0, 0, 0, 0, 0, 1], [0, 7, 31, 63, 127, 255, 255, 255], [0, 128, 224, 240, 248, 252, 252, 254], [255, 255, 127, 127, 63, 31, 15, 3], [255, 255, 254, 254, 252, 248, 240, 192], [127, 127, 63, 63, 31, 15, 7, 1], [255, 255, 255, 255, 254, 252, 248, 224], [128, 128, 0, 0, 0, 0, 0, 0], [63, 63, 31, 31, 15, 7, 3, 0], [255, 255, 255, 255, 255, 254, 252, 248], [31, 31, 15, 15, 7, 3, 1, 0], [255, 255, 255, 255, 255, 255, 254, 252], [255, 255, 255, 255, 255, 255, 255, 60], [255, 255, 255, 255, 255, 255, 127, 63], [248, 248, 240, 240, 224, 192, 128, 0], [255, 255, 255, 255, 255, 127, 63, 31], [252, 252, 248, 248, 240, 224, 192, 0], [1, 1, 0, 0, 0, 0, 0, 0], [255, 255, 255, 255, 127, 63, 31, 7], [254, 254, 252, 252, 248, 240, 224, 128], [0, 0, 192, 240, 248, 252, 254, 254], [0, 0, 224, 248, 252, 254, 255, 255], [0, 0, 0, 1, 7, 15, 31, 63], [0, 0, 240, 252, 254, 255, 255, 255], [0, 0, 120, 254, 255, 255, 255, 255], [0, 0, 60, 255, 255, 255, 255, 255], [0, 0, 30, 127, 255, 255, 255, 255], [0, 0, 15, 63, 127, 255, 255, 255], [0, 0, 0, 128, 224, 240, 248, 252], [0, 0, 7, 31, 63, 127, 255, 255], [127, 127, 127, 63, 63, 31, 15, 7], [63, 63, 63, 31, 31, 15, 7, 3], [31, 31, 31, 15, 15, 7, 3, 1], [255, 255, 255, 255, 255, 255, 255, 254], [224, 224, 224, 192, 192, 128, 0, 0], [15, 15, 15, 7, 7, 3, 1, 0], [255, 255, 255, 255, 255, 255, 255, 255], [240, 240, 240, 224, 224, 192, 128, 0], [7, 7, 7, 3, 3, 1, 0, 0], [255, 255, 255, 255, 255, 255, 255, 127], [248, 248, 248, 240, 240, 224, 192, 128], [252, 252, 252, 248, 248, 240, 224, 192], [254, 254, 254, 252, 252, 248, 240, 224], [7, 0, 0, 0, 0, 0, 0, 0], [224, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 3, 15, 31, 63, 127], [0, 0, 0, 192, 240, 248, 252, 254], [0, 0, 0, 224, 248, 252, 254, 255], [0, 0, 0, 0, 3, 7, 15, 31], [0, 0, 0, 240, 252, 254, 255, 255], [0, 0, 0, 0, 0, 3, 7, 15], [0, 0, 0, 120, 254, 255, 255, 255], [0, 0, 0, 60, 255, 255, 255, 255], [0, 0, 0, 30, 127, 255, 255, 255], [0, 0, 0, 0, 0, 192, 224, 240], [0, 0, 0, 15, 63, 127, 255, 255], [0, 0, 0, 0, 128, 224, 240, 248], [0, 0, 0, 7, 31, 63, 127, 255], [63, 127, 127, 127, 63, 63, 31, 15], [0, 128, 128, 128, 0, 0, 0, 0], [31, 63, 63, 63, 31, 31, 15, 7], [128, 192, 192, 192, 128, 128, 0, 0], [15, 31, 31, 31, 15, 15, 7, 3], [192, 224, 224, 224, 192, 192, 128, 0], [7, 15, 15, 15, 7, 7, 3, 1], [224, 240, 240, 240, 224, 224, 192, 128], [3, 7, 7, 7, 3, 3, 1, 0], [240, 248, 248, 248, 240, 240, 224, 192], [1, 3, 3, 3, 1, 1, 0, 0], [248, 252, 252, 252, 248, 248, 240, 224], [0, 0, 1, 1, 1, 0, 0, 0], [252, 254, 254, 254, 252, 252, 248, 240], [7, 3, 1, 0, 0, 0, 0, 0], [248, 224, 0, 0, 0, 0, 0, 0], [254, 120, 0, 0, 0, 0, 0, 0], [255, 60, 0, 0, 0, 0, 0, 0], [127, 30, 0, 0, 0, 0, 0, 0], [31, 7, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 224, 248, 252, 254], [0, 0, 0, 0, 240, 252, 254, 255], [0, 0, 0, 0, 120, 254, 255, 255], [0, 0, 0, 0, 60, 255, 255, 255], [0, 0, 0, 0, 30, 127, 255, 255], [0, 0, 0, 0, 15, 63, 127, 255], [0, 0, 0, 0, 7, 31, 63, 127], [127, 127, 255, 255, 255, 127, 127, 63], [254, 254, 255, 255, 255, 254, 254, 252], [63, 63, 127, 127, 127, 63, 63, 31], [31, 31, 63, 63, 63, 31, 31, 15], [128, 128, 192, 192, 192, 128, 128, 0], [15, 15, 31, 31, 31, 15, 15, 7], [192, 192, 224, 224, 224, 192, 192, 128], [7, 7, 15, 15, 15, 7, 7, 3], [224, 224, 240, 240, 240, 224, 224, 192], [3, 3, 7, 7, 7, 3, 3, 1], [240, 240, 248, 248, 248, 240, 240, 224], [1, 1, 3, 3, 3, 1, 1, 0], [248, 248, 252, 252, 252, 248, 248, 240], [252, 252, 254, 254, 254, 252, 252, 248], [15, 7, 3, 0, 0, 0, 0, 0], [248, 240, 224, 128, 0, 0, 0, 0], [252, 248, 224, 0, 0, 0, 0, 0], [254, 252, 240, 0, 0, 0, 0, 0], [255, 254, 120, 0, 0, 0, 0, 0], [255, 255, 60, 0, 0, 0, 0, 0], [255, 127, 30, 0, 0, 0, 0, 0], [127, 63, 15, 0, 0, 0, 0, 0], [224, 192, 128, 0, 0, 0, 0, 0], [63, 31, 7, 0, 0, 0, 0, 0], [240, 224, 192, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 224, 248, 252], [0, 0, 0, 0, 0, 240, 252, 254], [0, 0, 0, 0, 0, 120, 254, 255], [0, 0, 0, 0, 0, 60, 255, 255], [0, 0, 0, 0, 0, 30, 127, 255], [0, 0, 0, 0, 0, 15, 63, 127], [0, 0, 0, 0, 0, 7, 31, 63], [63, 127, 127, 255, 255, 255, 127, 127], [252, 254, 254, 255, 255, 255, 254, 254], [31, 63, 63, 127, 127, 127, 63, 63], [254, 255, 255, 255, 255, 255, 255, 255], [0, 0, 0, 128, 128, 128, 0, 0], [15, 31, 31, 63, 63, 63, 31, 31], [0, 128, 128, 192, 192, 192, 128, 128], [7, 15, 15, 31, 31, 31, 15, 15], [128, 192, 192, 224, 224, 224, 192, 192], [3, 7, 7, 15, 15, 15, 7, 7], [192, 224, 224, 240, 240, 240, 224, 224], [1, 3, 3, 7, 7, 7, 3, 3], [224, 240, 240, 248, 248, 248, 240, 240], [0, 1, 1, 3, 3, 3, 1, 1], [240, 248, 248, 252, 252, 252, 248, 248], [0, 0, 0, 1, 1, 1, 0, 0], [127, 255, 255, 255, 255, 255, 255, 255], [248, 252, 252, 254, 254, 254, 252, 252], [63, 31, 15, 3, 0, 0, 0, 0], [252, 248, 240, 224, 128, 0, 0, 0], [31, 15, 7, 3, 0, 0, 0, 0], [254, 252, 248, 224, 0, 0, 0, 0], [255, 254, 252, 240, 0, 0, 0, 0], [255, 255, 254, 120, 0, 0, 0, 0], [255, 255, 255, 60, 0, 0, 0, 0], [255, 127, 63, 15, 0, 0, 0, 0], [127, 63, 31, 7, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 240], [0, 0, 0, 0, 0, 0, 224, 248], [0, 0, 0, 0, 0, 0, 120, 254], [0, 0, 0, 0, 0, 0, 60, 255], [0, 0, 0, 0, 0, 0, 30, 127], [0, 0, 0, 0, 0, 0, 7, 31], [15, 31, 63, 63, 127, 127, 127, 63], [7, 15, 31, 31, 63, 63, 63, 31], [0, 0, 128, 128, 192, 192, 192, 128], [3, 7, 15, 15, 31, 31, 31, 15], [0, 128, 192, 192, 224, 224, 224, 192], [1, 3, 7, 7, 15, 15, 15, 7], [128, 192, 224, 224, 240, 240, 240, 224], [0, 1, 3, 3, 7, 7, 7, 3], [192, 224, 240, 240, 248, 248, 248, 240], [0, 0, 1, 1, 3, 3, 3, 1], [224, 240, 248, 248, 252, 252, 252, 248], [240, 248, 252, 252, 254, 254, 254, 252], [127, 63, 31, 15, 3, 0, 0, 0], [254, 252, 248, 240, 192, 0, 0, 0], [255, 254, 252, 248, 224, 0, 0, 0], [255, 255, 254, 252, 240, 0, 0, 0], [255, 255, 255, 254, 120, 0, 0, 0], [255, 255, 255, 255, 60, 0, 0, 0], [255, 255, 255, 127, 30, 0, 0, 0], [255, 255, 127, 63, 15, 0, 0, 0], [255, 127, 63, 31, 7, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 30], [0, 0, 0, 0, 0, 0, 0, 7], [7, 15, 31, 63, 63, 127, 127, 127], [3, 7, 15, 31, 31, 63, 63, 63], [1, 3, 7, 15, 15, 31, 31, 31], [0, 0, 128, 192, 192, 224, 224, 224], [0, 1, 3, 7, 7, 15, 15, 15], [0, 128, 192, 224, 224, 240, 240, 240], [0, 0, 1, 3, 3, 7, 7, 7], [128, 192, 224, 240, 240, 248, 248, 248], [192, 224, 240, 248, 248, 252, 252, 252], [224, 240, 248, 252, 252, 254, 254, 254], [127, 127, 63, 31, 15, 3, 0, 0], [254, 254, 252, 248, 240, 192, 0, 0], [255, 255, 254, 252, 248, 224, 0, 0], [255, 255, 255, 254, 252, 240, 0, 0], [255, 255, 255, 255, 254, 120, 0, 0], [255, 255, 255, 255, 255, 60, 0, 0], [255, 255, 255, 255, 127, 30, 0, 0], [255, 255, 255, 127, 63, 15, 0, 0], [255, 255, 127, 63, 31, 7, 0, 0]];
+const STAMPS = [[{"dr": 0, "dc": 0, "ch": 0}, {"dr": 0, "dc": 1, "ch": 1}, {"dr": 1, "dc": 0, "ch": 24}, {"dr": 1, "dc": 1, "ch": 25}], [{"dr": 0, "dc": 0, "ch": 3}, {"dr": 0, "dc": 1, "ch": 4}, {"dr": 1, "dc": 0, "ch": 26}, {"dr": 1, "dc": 1, "ch": 27}], [{"dr": 0, "dc": 0, "ch": 6}, {"dr": 0, "dc": 1, "ch": 7}, {"dr": 0, "dc": 2, "ch": 8}, {"dr": 1, "dc": 0, "ch": 29}, {"dr": 1, "dc": 1, "ch": 30}, {"dr": 1, "dc": 2, "ch": 31}], [{"dr": 0, "dc": 0, "ch": 9}, {"dr": 0, "dc": 1, "ch": 10}, {"dr": 0, "dc": 2, "ch": 11}, {"dr": 1, "dc": 0, "ch": 32}, {"dr": 1, "dc": 1, "ch": 33}, {"dr": 1, "dc": 2, "ch": 34}], [{"dr": 0, "dc": 0, "ch": 12}, {"dr": 0, "dc": 1, "ch": 13}, {"dr": 0, "dc": 2, "ch": 14}, {"dr": 1, "dc": 0, "ch": 35}, {"dr": 1, "dc": 1, "ch": 36}, {"dr": 1, "dc": 2, "ch": 37}], [{"dr": 0, "dc": 0, "ch": 15}, {"dr": 0, "dc": 1, "ch": 16}, {"dr": 0, "dc": 2, "ch": 17}, {"dr": 1, "dc": 0, "ch": 38}, {"dr": 1, "dc": 1, "ch": 39}, {"dr": 1, "dc": 2, "ch": 40}], [{"dr": 0, "dc": 0, "ch": 18}, {"dr": 0, "dc": 1, "ch": 19}, {"dr": 0, "dc": 2, "ch": 20}, {"dr": 1, "dc": 0, "ch": 41}, {"dr": 1, "dc": 1, "ch": 42}, {"dr": 1, "dc": 2, "ch": 43}], [{"dr": 0, "dc": 0, "ch": 21}, {"dr": 0, "dc": 1, "ch": 22}, {"dr": 0, "dc": 2, "ch": 23}, {"dr": 1, "dc": 0, "ch": 44}, {"dr": 1, "dc": 1, "ch": 45}, {"dr": 1, "dc": 2, "ch": 46}], [{"dr": 0, "dc": 0, "ch": 47}, {"dr": 0, "dc": 1, "ch": 48}, {"dr": 1, "dc": 0, "ch": 66}, {"dr": 1, "dc": 1, "ch": 67}], [{"dr": 0, "dc": 0, "ch": 49}, {"dr": 0, "dc": 1, "ch": 50}, {"dr": 1, "dc": 0, "ch": 68}, {"dr": 1, "dc": 1, "ch": 69}], [{"dr": 0, "dc": 0, "ch": 52}, {"dr": 0, "dc": 1, "ch": 53}, {"dr": 0, "dc": 2, "ch": 54}, {"dr": 1, "dc": 0, "ch": 71}, {"dr": 1, "dc": 1, "ch": 72}, {"dr": 1, "dc": 2, "ch": 34}], [{"dr": 0, "dc": 0, "ch": 12}, {"dr": 0, "dc": 1, "ch": 55}, {"dr": 0, "dc": 2, "ch": 56}, {"dr": 1, "dc": 0, "ch": 73}, {"dr": 1, "dc": 1, "ch": 74}, {"dr": 1, "dc": 2, "ch": 37}], [{"dr": 0, "dc": 0, "ch": 15}, {"dr": 0, "dc": 1, "ch": 57}, {"dr": 0, "dc": 2, "ch": 11}, {"dr": 1, "dc": 0, "ch": 32}, {"dr": 1, "dc": 1, "ch": 75}, {"dr": 1, "dc": 2, "ch": 40}], [{"dr": 0, "dc": 0, "ch": 58}, {"dr": 0, "dc": 1, "ch": 59}, {"dr": 0, "dc": 2, "ch": 14}, {"dr": 1, "dc": 0, "ch": 35}, {"dr": 1, "dc": 1, "ch": 76}, {"dr": 1, "dc": 2, "ch": 77}], [{"dr": 0, "dc": 0, "ch": 60}, {"dr": 0, "dc": 1, "ch": 61}, {"dr": 0, "dc": 2, "ch": 62}, {"dr": 1, "dc": 0, "ch": 38}, {"dr": 1, "dc": 1, "ch": 78}, {"dr": 1, "dc": 2, "ch": 79}], [{"dr": 0, "dc": 0, "ch": 63}, {"dr": 0, "dc": 1, "ch": 64}, {"dr": 0, "dc": 2, "ch": 65}, {"dr": 1, "dc": 0, "ch": 80}, {"dr": 1, "dc": 1, "ch": 81}, {"dr": 1, "dc": 2, "ch": 82}], [{"dr": 0, "dc": 0, "ch": 49}, {"dr": 0, "dc": 1, "ch": 83}, {"dr": 1, "dc": 0, "ch": 81}, {"dr": 1, "dc": 1, "ch": 69}, {"dr": 2, "dc": 0, "ch": 106}, {"dr": 2, "dc": 1, "ch": 31}], [{"dr": 0, "dc": 0, "ch": 52}, {"dr": 0, "dc": 1, "ch": 84}, {"dr": 1, "dc": 0, "ch": 93}, {"dr": 1, "dc": 1, "ch": 72}, {"dr": 2, "dc": 0, "ch": 44}, {"dr": 2, "dc": 1, "ch": 107}], [{"dr": 0, "dc": 0, "ch": 85}, {"dr": 0, "dc": 1, "ch": 86}, {"dr": 0, "dc": 2, "ch": 5}, {"dr": 1, "dc": 0, "ch": 94}, {"dr": 1, "dc": 1, "ch": 74}, {"dr": 1, "dc": 2, "ch": 34}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 107}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 15}, {"dr": 0, "dc": 1, "ch": 87}, {"dr": 0, "dc": 2, "ch": 8}, {"dr": 1, "dc": 0, "ch": 95}, {"dr": 1, "dc": 1, "ch": 96}, {"dr": 1, "dc": 2, "ch": 97}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 108}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 58}, {"dr": 0, "dc": 1, "ch": 88}, {"dr": 0, "dc": 2, "ch": 56}, {"dr": 1, "dc": 0, "ch": 98}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 100}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 108}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 18}, {"dr": 0, "dc": 1, "ch": 89}, {"dr": 0, "dc": 2, "ch": 11}, {"dr": 1, "dc": 0, "ch": 101}, {"dr": 1, "dc": 1, "ch": 102}, {"dr": 1, "dc": 2, "ch": 103}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 108}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 21}, {"dr": 0, "dc": 1, "ch": 90}, {"dr": 0, "dc": 2, "ch": 91}, {"dr": 1, "dc": 0, "ch": 38}, {"dr": 1, "dc": 1, "ch": 76}, {"dr": 1, "dc": 2, "ch": 104}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 106}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 92}, {"dr": 0, "dc": 2, "ch": 62}, {"dr": 1, "dc": 0, "ch": 80}, {"dr": 1, "dc": 1, "ch": 78}, {"dr": 1, "dc": 2, "ch": 105}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 106}, {"dr": 2, "dc": 2, "ch": 28}], [{"dr": 0, "dc": 0, "ch": 109}, {"dr": 0, "dc": 1, "ch": 110}, {"dr": 1, "dc": 0, "ch": 78}, {"dr": 1, "dc": 1, "ch": 72}, {"dr": 2, "dc": 0, "ch": 136}, {"dr": 2, "dc": 1, "ch": 137}], [{"dr": 0, "dc": 0, "ch": 85}, {"dr": 0, "dc": 1, "ch": 111}, {"dr": 1, "dc": 0, "ch": 122}, {"dr": 1, "dc": 1, "ch": 74}, {"dr": 2, "dc": 0, "ch": 106}, {"dr": 2, "dc": 1, "ch": 137}], [{"dr": 0, "dc": 0, "ch": 112}, {"dr": 0, "dc": 1, "ch": 113}, {"dr": 0, "dc": 2, "ch": 51}, {"dr": 1, "dc": 0, "ch": 124}, {"dr": 1, "dc": 1, "ch": 96}, {"dr": 1, "dc": 2, "ch": 125}, {"dr": 2, "dc": 0, "ch": 106}, {"dr": 2, "dc": 1, "ch": 137}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 114}, {"dr": 0, "dc": 1, "ch": 115}, {"dr": 0, "dc": 2, "ch": 54}, {"dr": 1, "dc": 0, "ch": 126}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 127}, {"dr": 2, "dc": 0, "ch": 44}, {"dr": 2, "dc": 1, "ch": 138}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 18}, {"dr": 0, "dc": 1, "ch": 116}, {"dr": 0, "dc": 2, "ch": 8}, {"dr": 1, "dc": 0, "ch": 128}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 129}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 139}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 60}, {"dr": 0, "dc": 1, "ch": 117}, {"dr": 0, "dc": 2, "ch": 118}, {"dr": 1, "dc": 0, "ch": 130}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 131}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 140}, {"dr": 2, "dc": 2, "ch": 28}], [{"dr": 0, "dc": 0, "ch": 63}, {"dr": 0, "dc": 1, "ch": 119}, {"dr": 0, "dc": 2, "ch": 120}, {"dr": 1, "dc": 0, "ch": 132}, {"dr": 1, "dc": 1, "ch": 102}, {"dr": 1, "dc": 2, "ch": 133}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 141}, {"dr": 2, "dc": 2, "ch": 31}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 121}, {"dr": 0, "dc": 2, "ch": 91}, {"dr": 1, "dc": 0, "ch": 134}, {"dr": 1, "dc": 1, "ch": 76}, {"dr": 1, "dc": 2, "ch": 135}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 141}, {"dr": 2, "dc": 2, "ch": 31}], [{"dr": 0, "dc": 0, "ch": 85}, {"dr": 0, "dc": 1, "ch": 91}, {"dr": 1, "dc": 0, "ch": 149}, {"dr": 1, "dc": 1, "ch": 150}, {"dr": 2, "dc": 0, "ch": 163}, {"dr": 2, "dc": 1, "ch": 164}], [{"dr": 0, "dc": 0, "ch": 112}, {"dr": 0, "dc": 1, "ch": 142}, {"dr": 1, "dc": 0, "ch": 151}, {"dr": 1, "dc": 1, "ch": 96}, {"dr": 2, "dc": 0, "ch": 163}, {"dr": 2, "dc": 1, "ch": 165}], [{"dr": 0, "dc": 0, "ch": 114}, {"dr": 0, "dc": 1, "ch": 143}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 152}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 153}, {"dr": 2, "dc": 0, "ch": 136}, {"dr": 2, "dc": 1, "ch": 166}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 18}, {"dr": 0, "dc": 1, "ch": 144}, {"dr": 0, "dc": 2, "ch": 51}, {"dr": 1, "dc": 0, "ch": 154}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 155}, {"dr": 2, "dc": 0, "ch": 41}, {"dr": 2, "dc": 1, "ch": 167}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 60}, {"dr": 0, "dc": 1, "ch": 145}, {"dr": 0, "dc": 2, "ch": 54}, {"dr": 1, "dc": 0, "ch": 156}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 157}, {"dr": 2, "dc": 0, "ch": 44}, {"dr": 2, "dc": 1, "ch": 168}, {"dr": 2, "dc": 2, "ch": 28}], [{"dr": 0, "dc": 0, "ch": 63}, {"dr": 0, "dc": 1, "ch": 146}, {"dr": 0, "dc": 2, "ch": 8}, {"dr": 1, "dc": 0, "ch": 158}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 159}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 169}, {"dr": 2, "dc": 2, "ch": 31}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 147}, {"dr": 0, "dc": 2, "ch": 118}, {"dr": 1, "dc": 0, "ch": 160}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 161}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 170}, {"dr": 2, "dc": 2, "ch": 171}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 148}, {"dr": 0, "dc": 2, "ch": 120}, {"dr": 1, "dc": 0, "ch": 134}, {"dr": 1, "dc": 1, "ch": 102}, {"dr": 1, "dc": 2, "ch": 162}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 172}, {"dr": 2, "dc": 2, "ch": 173}], [{"dr": 0, "dc": 0, "ch": 114}, {"dr": 0, "dc": 1, "ch": 120}, {"dr": 1, "dc": 0, "ch": 181}, {"dr": 1, "dc": 1, "ch": 182}, {"dr": 2, "dc": 0, "ch": 199}, {"dr": 2, "dc": 1, "ch": 200}], [{"dr": 0, "dc": 0, "ch": 114}, {"dr": 0, "dc": 1, "ch": 174}, {"dr": 1, "dc": 0, "ch": 183}, {"dr": 1, "dc": 1, "ch": 184}, {"dr": 2, "dc": 0, "ch": 201}, {"dr": 2, "dc": 1, "ch": 202}], [{"dr": 0, "dc": 0, "ch": 18}, {"dr": 0, "dc": 1, "ch": 175}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 186}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 187}, {"dr": 2, "dc": 0, "ch": 163}, {"dr": 2, "dc": 1, "ch": 203}, {"dr": 2, "dc": 2, "ch": 2}], [{"dr": 0, "dc": 0, "ch": 60}, {"dr": 0, "dc": 1, "ch": 176}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 188}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 189}, {"dr": 2, "dc": 0, "ch": 136}, {"dr": 2, "dc": 1, "ch": 204}, {"dr": 2, "dc": 2, "ch": 28}], [{"dr": 0, "dc": 0, "ch": 63}, {"dr": 0, "dc": 1, "ch": 177}, {"dr": 0, "dc": 2, "ch": 51}, {"dr": 1, "dc": 0, "ch": 190}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 191}, {"dr": 2, "dc": 0, "ch": 41}, {"dr": 2, "dc": 1, "ch": 205}, {"dr": 2, "dc": 2, "ch": 31}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 178}, {"dr": 0, "dc": 2, "ch": 54}, {"dr": 1, "dc": 0, "ch": 192}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 193}, {"dr": 2, "dc": 0, "ch": 44}, {"dr": 2, "dc": 1, "ch": 205}, {"dr": 2, "dc": 2, "ch": 171}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 179}, {"dr": 0, "dc": 2, "ch": 8}, {"dr": 1, "dc": 0, "ch": 194}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 195}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 206}, {"dr": 2, "dc": 2, "ch": 173}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 180}, {"dr": 0, "dc": 2, "ch": 118}, {"dr": 1, "dc": 0, "ch": 196}, {"dr": 1, "dc": 1, "ch": 197}, {"dr": 1, "dc": 2, "ch": 198}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 207}, {"dr": 2, "dc": 2, "ch": 164}], [{"dr": 0, "dc": 0, "ch": 18}, {"dr": 0, "dc": 1, "ch": 208}, {"dr": 1, "dc": 0, "ch": 19}, {"dr": 1, "dc": 1, "ch": 7}, {"dr": 2, "dc": 0, "ch": 226}, {"dr": 2, "dc": 1, "ch": 227}], [{"dr": 0, "dc": 0, "ch": 60}, {"dr": 0, "dc": 1, "ch": 209}, {"dr": 1, "dc": 0, "ch": 214}, {"dr": 1, "dc": 1, "ch": 10}, {"dr": 2, "dc": 0, "ch": 199}, {"dr": 2, "dc": 1, "ch": 228}], [{"dr": 0, "dc": 0, "ch": 63}, {"dr": 0, "dc": 1, "ch": 209}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 215}, {"dr": 1, "dc": 1, "ch": 184}, {"dr": 1, "dc": 2, "ch": 216}, {"dr": 2, "dc": 0, "ch": 201}, {"dr": 2, "dc": 1, "ch": 229}, {"dr": 2, "dc": 2, "ch": 28}], [{"dr": 0, "dc": 0, "ch": 63}, {"dr": 0, "dc": 1, "ch": 210}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 217}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 218}, {"dr": 2, "dc": 0, "ch": 163}, {"dr": 2, "dc": 1, "ch": 230}, {"dr": 2, "dc": 2, "ch": 31}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 211}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 219}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 220}, {"dr": 2, "dc": 0, "ch": 136}, {"dr": 2, "dc": 1, "ch": 231}, {"dr": 2, "dc": 2, "ch": 171}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 212}, {"dr": 0, "dc": 2, "ch": 51}, {"dr": 1, "dc": 0, "ch": 221}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 222}, {"dr": 2, "dc": 0, "ch": 41}, {"dr": 2, "dc": 1, "ch": 232}, {"dr": 2, "dc": 2, "ch": 173}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 213}, {"dr": 0, "dc": 2, "ch": 54}, {"dr": 1, "dc": 0, "ch": 223}, {"dr": 1, "dc": 1, "ch": 197}, {"dr": 1, "dc": 2, "ch": 224}, {"dr": 2, "dc": 0, "ch": 44}, {"dr": 2, "dc": 1, "ch": 233}, {"dr": 2, "dc": 2, "ch": 164}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 213}, {"dr": 0, "dc": 2, "ch": 54}, {"dr": 1, "dc": 0, "ch": 196}, {"dr": 1, "dc": 1, "ch": 16}, {"dr": 1, "dc": 2, "ch": 225}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 234}, {"dr": 2, "dc": 2, "ch": 200}], [{"dr": 0, "dc": 0, "ch": 63}, {"dr": 0, "dc": 1, "ch": 54}, {"dr": 1, "dc": 0, "ch": 22}, {"dr": 1, "dc": 1, "ch": 4}, {"dr": 2, "dc": 0, "ch": 247}, {"dr": 2, "dc": 1, "ch": 248}], [{"dr": 0, "dc": 0, "ch": 63}, {"dr": 0, "dc": 1, "ch": 208}, {"dr": 1, "dc": 0, "ch": 237}, {"dr": 1, "dc": 1, "ch": 7}, {"dr": 2, "dc": 0, "ch": 29}, {"dr": 2, "dc": 1, "ch": 249}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 208}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 238}, {"dr": 1, "dc": 1, "ch": 10}, {"dr": 1, "dc": 2, "ch": 56}, {"dr": 2, "dc": 0, "ch": 32}, {"dr": 2, "dc": 1, "ch": 250}, {"dr": 2, "dc": 2, "ch": 70}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 208}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 239}, {"dr": 1, "dc": 1, "ch": 184}, {"dr": 1, "dc": 2, "ch": 240}, {"dr": 2, "dc": 0, "ch": 35}, {"dr": 2, "dc": 1, "ch": 251}, {"dr": 2, "dc": 2, "ch": 171}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 235}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 241}, {"dr": 1, "dc": 1, "ch": 99}, {"dr": 1, "dc": 2, "ch": 242}, {"dr": 2, "dc": 0, "ch": 38}, {"dr": 2, "dc": 1, "ch": 252}, {"dr": 2, "dc": 2, "ch": 34}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 235}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 243}, {"dr": 1, "dc": 1, "ch": 197}, {"dr": 1, "dc": 2, "ch": 244}, {"dr": 2, "dc": 0, "ch": 136}, {"dr": 2, "dc": 1, "ch": 253}, {"dr": 2, "dc": 2, "ch": 37}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 236}, {"dr": 0, "dc": 2, "ch": 2}, {"dr": 1, "dc": 0, "ch": 58}, {"dr": 1, "dc": 1, "ch": 16}, {"dr": 1, "dc": 2, "ch": 245}, {"dr": 2, "dc": 0, "ch": 80}, {"dr": 2, "dc": 1, "ch": 254}, {"dr": 2, "dc": 2, "ch": 200}], [{"dr": 0, "dc": 0, "ch": 2}, {"dr": 0, "dc": 1, "ch": 236}, {"dr": 0, "dc": 2, "ch": 51}, {"dr": 1, "dc": 0, "ch": 21}, {"dr": 1, "dc": 1, "ch": 19}, {"dr": 1, "dc": 2, "ch": 246}, {"dr": 2, "dc": 0, "ch": 2}, {"dr": 2, "dc": 1, "ch": 255}, {"dr": 2, "dc": 2, "ch": 43}]];
+const EMPTY_IDX = 2;
+
+const C64W=320,C64H=200,CHW=8,CHH=8,COLS=40,ROWS=25;
+const SCALE=2,SPRITE_W=24,SPRITE_H=21,MUX_H=21,MAX_SPR_LINE=8,FPS=50;
+const SPR_CX=8,SPR_CY=7; // ball 16x15, visual center at (7.5,7.0); round positioning minimizes error
+
+// Actual sprite bitmap (24x21, 3 bytes per row)
+const SPR_BYTES=[0x03,0xc0,0x00,0x0f,0xf0,0x00,0x1f,0xf8,0x00,0x3f,0xfc,0x00,0x7f,0xfe,0x00,0x7f,0xfe,0x00,0xff,0xff,0x00,0xff,0xff,0x00,0xff,0xff,0x00,0x7f,0xfe,0x00,0x7f,0xfe,0x00,0x3f,0xfc,0x00,0x1f,0xf8,0x00,0x0f,0xf0,0x00,0x03,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00];
+const sprPixels=new Uint8Array(SPRITE_W*SPRITE_H);
+for(let r=0;r<SPRITE_H;r++)for(let c=0;c<SPRITE_W;c++){
+  const byteIdx=r*3+Math.floor(c/8);
+  sprPixels[r*SPRITE_W+c]=(SPR_BYTES[byteIdx]>>(7-(c%8)))&1;
+}
+
+const charPixels=[];
+for(let i=0;i<256;i++){
+  const px=new Uint8Array(64);
+  for(let r=0;r<8;r++){const b=CHARSET[i][r];for(let bit=0;bit<8;bit++)px[r*8+bit]=(b>>(7-bit))&1;}
+  charPixels.push(px);
+}
+
+let frame=0,totalFrames=304,playing=true,speed=1.0;
+// Phase 1: 0-127 EXTEND appears
+// Phase 2: 128-383 rotation (256 frames)
+// Phase 3: 384-479 Exit effect (96 frames)
+let corruptTotal=0,lastCorruptFrame=-1,accumMemBytes=0,peakFrameBytes=0;
+let lastTime=0,accum=0;
+let opts={grid:false,color:true,ids:false,corruption:true,c64only:true,mux:false};
+
+const mainC=document.getElementById('mainCanvas');
+const mainCtx=mainC.getContext('2d');
+mainC.width=C64W*SCALE;mainC.height=C64H*SCALE;
+const offC=document.createElement('canvas');offC.width=C64W;offC.height=C64H;
+const offCtx=offC.getContext('2d');const offImg=offCtx.createImageData(C64W,C64H);
+const scanC=document.getElementById('scanlineCanvas');const scanCtx=scanC.getContext('2d');
+const tlC=document.getElementById('timelineCanvas');const tlCtx=tlC.getContext('2d');
+function resizeSide(){const r1=scanC.parentElement.getBoundingClientRect();scanC.width=r1.width;scanC.height=r1.height;const r2=tlC.parentElement.getBoundingClientRect();tlC.width=r2.width;tlC.height=r2.height;}
+resizeSide();window.addEventListener('resize',resizeSide);
+
+// ============================================================
+// Stamp lookup
+// ============================================================
+function getStampCells(px,py){
+  const xs=((px|0)%8+8)%8,ys=((py|0)%8+8)%8;
+  const stamp=STAMPS[ys*8+xs];
+  const br=Math.floor(py/8)-1,bc=Math.floor(px/8)-1;
+  return stamp.map(s=>({row:br+s.dr,col:bc+s.dc,ch:s.ch})).filter(s=>s.row>=0&&s.row<ROWS&&s.col>=0&&s.col<COLS);
+}
+
+// ============================================================
+// Movement choreography: positions only, no allocation logic
+// ============================================================
+const CX=160,CY=100;
+
+function easeIO(t){return t<.5?2*t*t:1-(-2*t+2)**2/2;}
+
+// ============================================================
+// EXTEND vertical logo — all discs flat at z=0
+// ============================================================
+const GEO_R=85;
+const GEO_DIST=400;
+const F_END=256;
+
+// 7-wide, 7-tall pixel font (thin strokes)
+const FONT={
+  E:[[0,1,2,3,4,5,6],[0],[0],[0,1,2,3,4],[0],[0],[0,1,2,3,4,5,6]],
+  X:[[0,6],[1,5],[2,4],[3],[2,4],[1,5],[0,6]],
+  T:[[0,1,2,3,4,5,6],[3],[3],[3],[3],[3],[3]],
+  N:[[0,6],[0,1,6],[0,2,6],[0,3,6],[0,4,6],[0,5,6],[0,6]],
+  D:[[0,1,2,3,4],[0,5],[0,6],[0,6],[0,6],[0,5],[0,1,2,3,4]]
+};
+const LOGO='EXTEND';
+const LOGO_PTS=[];
+let _yOff=0;
+const LETTER_RANGES=[];
+for(const ch of LOGO){
+  const rows=FONT[ch];
+  const startIdx=LOGO_PTS.length;
+  rows.forEach((cols,r)=>cols.forEach(c=>LOGO_PTS.push({gx:c,gy:_yOff+r,letter:ch})));
+  LETTER_RANGES.push({start:startIdx,end:LOGO_PTS.length});
+  _yOff+=rows.length+3; // 3 row gap between letters
+}
+const LOGO_TOTAL_ROWS=_yOff-1;
+const N_VERTS=LOGO_PTS.length;
+
+// Convert to 3D coords — vertical layout (phases 1-2) and horizontal (phase 3)
+// Use consistent cell size so letters look the same shape in both layouts
+const CELL=0.0595; // spacing per grid unit (same x and y)
+const GEO_VERTS_V=[]; // vertical
+const GEO_VERTS_H=[]; // horizontal
+{
+  // Vertical layout: letters stacked, centered on x=0
+  // Each letter: 7 cols (gx 0-6), 7 rows, with 3-row gaps between letters
+  const letterCentersV=[];
+  let _ly=0;
+  for(const ch of LOGO){
+    const rows=FONT[ch];
+    letterCentersV.push({cx:3, cy:_ly+3}); // center of 7x7 letter
+    _ly+=rows.length+3;
+  }
+  const midVY=(_ly-3+6)/2; // vertical midpoint of all letters
+
+  for(let i=0;i<LOGO_PTS.length;i++){
+    const p=LOGO_PTS[i];
+    const x=(p.gx-3)*CELL;
+    const y=(p.gy-midVY)*CELL;
+    GEO_VERTS_V.push({x,y,z:0});
+  }
+
+  // Horizontal layout: letters side by side, centered on y=0
+  let _xOff=0;
+  const hRanges=[];
+  for(const ch of LOGO){
+    const rows=FONT[ch];
+    const w=Math.max(...rows.map(r=>Math.max(...r)))+1;
+    hRanges.push({xOff:_xOff,w});
+    _xOff+=w+1; // 1 col gap
+  }
+  const totalW=_xOff-1;
+  const midHX=(totalW-1)/2;
+  const midHY=3; // center of 7-row letter
+
+  let li=0;
+  for(let i=0;i<LOGO_PTS.length;i++){
+    while(li<LETTER_RANGES.length-1&&i>=LETTER_RANGES[li].end) li++;
+    const p=LOGO_PTS[i];
+    const hr=hRanges[li];
+    const localRow=p.gy-(li===0?0:LOGO_PTS[LETTER_RANGES[li].start].gy);
+    const hx=(hr.xOff+p.gx-midHX)*CELL;
+    const hy=(localRow-midHY)*CELL;
+    GEO_VERTS_H.push({x:hx,y:hy,z:0});
+  }
+}
+// Start with vertical
+const GEO_VERTS=GEO_VERTS_V.map(v=>({...v}));
+
+function genPositions(f){
+  const P1_END=64, P2_END=128, P3_END=256, P4_END=304;
+  const TRAIL_LIFE=12;
+  
+  const EXIT_FRAMES=48;
+
+  const eRange=LETTER_RANGES[0]; // E is first letter
+
+  // --- Layout morph: vertical→horizontal (during phase 3 settle) ---
+  const MORPH_FRAMES=Math.floor((P3_END-P2_END)*0.2); // 20% of phase 3 = ~51 frames
+  let morphT=0;
+  if(f>=P2_END&&f<P2_END+MORPH_FRAMES){
+    const mf=f-P2_END;
+    morphT=mf/MORPH_FRAMES;
+    morphT=morphT*morphT*(3-2*morphT);
+  } else if(f>=P2_END+MORPH_FRAMES){
+    morphT=1;
+  }
+
+  // --- Zoom & Pan (all continuous, CELL-based coords) ---
+  // Vertex y for E/D centers in vertical layout: (gy - midVY) * CELL
+  const _midVY=(function(){ let ly=0; for(const ch of LOGO){ly+=FONT[ch].length+3;} return (ly-3+6)/2; })();
+  const eVertY=(3-_midVY)*CELL;    // E center vertex y (row 3 of 7)
+  const dVertY=(53-_midVY)*CELL;   // D center vertex y (row 53)
+  // Horizontal layout: E/D center x
+  const _totalW=47, _midHX=(_totalW-1)/2;
+  const eVertX=(0+3-_midHX)*CELL;  // E center vertex x
+  const dVertX=(40+3-_midHX)*CELL; // D center vertex x
+
+  // panY to center on vertex y=vy: panY = -vy * GEO_R * zoom
+  // panX to center on vertex x=vx: panX = -vx * GEO_R * zoom
+
+  let zoomFactor, panY, panX=0, stretchX=1;
+
+  if(f<P1_END){
+    const t=f/P1_END, e=t*t*(3-2*t);
+    zoomFactor=2.5+(1.8-2.5)*e;
+    panY=-eVertY*GEO_R*zoomFactor;
+  } else if(f<P2_END){
+    const t=(f-P1_END)/(P2_END-P1_END), e=t*t*(3-2*t);
+    zoomFactor=1.8+(3.0-1.8)*e;
+    const startPanY=-eVertY*GEO_R*1.8;
+    const endPanY=-dVertY*GEO_R*3.0;
+    panY=startPanY+(endPanY-startPanY)*e;
+  } else {
+    zoomFactor=3.0;
+    const curR15=GEO_R*3.0;
+
+    if(f<P3_END){
+      const t=(f-P2_END)/(P3_END-P2_END);
+      const settleEnd=0.2;
+      if(t<settleEnd){
+        const st=t/settleEnd, se=st*st*(3-2*st);
+        // panY: from D-centered to 0 (horizontal is y-centered)
+        panY=(-dVertY*curR15)*(1-se);
+        panX=(-eVertX*curR15)*se;
+      } else {
+        const pt=(t-settleEnd)/(1-settleEnd);
+        panY=0;
+        // Pan from E to D horizontally
+        const ePanX=-eVertX*curR15;
+        const dPanX=-dVertX*curR15;
+        panX=ePanX+(dPanX-ePanX)*pt;
+      }
+    } else {
+      // Phase 4: stay on D, exit
+      panY=0;
+      panX=-dVertX*curR15;
+    }
+  }
+
+  // --- Rotation ---
+  let p;
+  if(f<P2_END){
+    p=0;
+  } else if(f<P3_END){
+    p=(f-P2_END)/F_END;
+  } else {
+    p=(P3_END-P2_END)/F_END+((f-P3_END)/EXIT_FRAMES)*0.5;
+  }
+
+  const ax=Math.sin(p*2*Math.PI)*0.18;
+  const ay=0;
+  const az=Math.sin(p*2*Math.PI)*0.04;
+  // 120 BPM pulse: sharp attack, fast decay, rest
+  const BPM_PERIOD=25; // frames per beat at 50fps = 120 BPM
+  const beatPhase=(f%BPM_PERIOD)/BPM_PERIOD;
+  let pulseAmt;
+  if(beatPhase<0.05){
+    pulseAmt=beatPhase/0.05; // snap in ~1 frame
+  } else if(beatPhase<0.5){
+    const decay=(beatPhase-0.05)/0.45;
+    pulseAmt=Math.exp(-decay*6); // fast exponential falloff
+  } else {
+    pulseAmt=0; // rest
+  }
+  // --- Glitch system ---
+  // Seeded PRNG for consistent glitches on replay
+  function glitchRand(seed){ return ((seed*1103515245+12345)&0x7fffffff)/0x7fffffff; }
+  
+  // Glitch zoom: random 2x zoom-in lasting 2-4 frames, triggered ~every 40-80 frames
+  let glitchZoom=1.0, glitchOffX=0, glitchOffY=0;
+  const glitchSeed=Math.floor(f/50);
+  const glitchChance=glitchRand(glitchSeed*7+3);
+  if(glitchChance>0.55){ // ~45% of 50-frame windows have a glitch
+    const glitchStart=Math.floor(glitchRand(glitchSeed*13+1)*46);
+    const glitchLen=2+Math.floor(glitchRand(glitchSeed*19+5)*3); // 2-4 frames
+    const localF=f%50;
+    if(localF>=glitchStart&&localF<glitchStart+glitchLen){
+      glitchZoom=1.6+glitchRand(glitchSeed*31+7)*0.8; // 1.6x-2.4x
+      // Offset to zoom toward a random point
+      glitchOffX=(glitchRand(glitchSeed*37+11)-0.5)*80;
+      glitchOffY=(glitchRand(glitchSeed*41+13)-0.5)*50;
+    }
+  }
+  
+  // Position glitch: random jitter on some discs for 1-2 frames
+
+  const pulse=1.0+0.12*pulseAmt;
+  const curR=GEO_R*zoomFactor*pulse;
+
+  const cx=Math.cos(ax),sx=Math.sin(ax);
+  const cy=Math.cos(ay),sy=Math.sin(ay);
+  const cz=Math.cos(az),sz=Math.sin(az);
+
+  // Camera shake on pulse during horizontal reveal (phases 3/4)
+  let shakeX=0, shakeY=0;
+  if(f>=P2_END){
+    const shakeAmt=pulseAmt*6; // pixels, tied to pulse intensity
+    shakeX=shakeAmt*Math.sin(f*7.3);
+    shakeY=shakeAmt*Math.cos(f*11.1);
+  }
+
+  function project(vx,vy,vz){
+    let x=vx,y=vy,z=vz;
+    let t1=x*cy+z*sy,t2=-x*sy+z*cy;x=t1;z=t2;
+    t1=y*cx-z*sx;t2=y*sx+z*cx;y=t1;z=t2;
+    t1=x*cz-y*sz;t2=x*sz+y*cz;x=t1;y=t2;
+    x*=stretchX;
+    const s=GEO_DIST/(GEO_DIST+z*curR);
+    let sx2=panX*pulse+shakeX+x*curR*s;
+    let sy2=panY*pulse+shakeY+y*curR*s;
+    // Massive barrel lens distortion
+    const nx=sx2/160, ny=sy2/100; // normalize to screen half-size
+    const r2=nx*nx+ny*ny;
+    const k=0.55; // distortion strength
+    const distort=1+k*r2;
+    sx2*=distort;
+    sy2*=distort;
+    return{x:CX+sx2,y:CY+sy2,z};
+  }
+
+  // --- Disc birth timing ---
+  function discBirth(i){
+    // E discs: phase 1, staggered
+    if(i<eRange.end){
+      const localIdx=i-eRange.start;
+      const localCount=eRange.end-eRange.start;
+      return Math.floor(localIdx/localCount*P1_END*0.7);
+    }
+    // XTEND discs: phase 2, letter by letter
+    for(let li=1;li<LETTER_RANGES.length;li++){
+      const lr=LETTER_RANGES[li];
+      if(i>=lr.start&&i<lr.end){
+        const framesPerLetter=Math.floor((P2_END-P1_END)/5); // 5 remaining letters
+        const localIdx=i-lr.start;
+        const localCount=lr.end-lr.start;
+        return P1_END+(li-1)*framesPerLetter+Math.floor(localIdx/localCount*framesPerLetter);
+      }
+    }
+    return 0;
+  }
+
+  // --- Exit: phase 4 ---
+  const isExit=f>=P3_END&&f<P4_END;
+  const exitT=isExit?(f-P3_END)/EXIT_FRAMES:0;
+  const EXIT_LIFE=14;
+
+  function exitDelay(i){
+    for(let li=LETTER_RANGES.length-1;li>=0;li--){
+      const lr=LETTER_RANGES[li];
+      if(i>=lr.start&&i<lr.end){
+        const revLi=LETTER_RANGES.length-1-li;
+        const localIdx=i-lr.start;
+        const localCount=lr.end-lr.start;
+        return revLi*0.1+localIdx/localCount*0.08;
+      }
+    }
+    return 0;
+  }
+
+  function exitProgress(i){
+    if(!isExit) return 0;
+    const delay=exitDelay(i);
+    return Math.max(0,Math.min(1,(exitT-delay)/(EXIT_LIFE/EXIT_FRAMES)));
+  }
+
+  // --- E letter scale: 2x in phase 1, shrinks to 1x in phase 2 ---
+  let eScale;
+  if(f<P1_END){
+    eScale=2.0;
+  } else if(f<P2_END){
+    const t=(f-P1_END)/(P2_END-P1_END);
+    const e=t*t*(3-2*t);
+    eScale=2.0+(1.0-2.0)*e;
+  } else {
+    eScale=1.0;
+  }
+
+  const result=[];
+
+  // Skip EXTEND discs during exit phase
+  if(f<P4_END){
+  for(let i=0;i<N_VERTS;i++){
+    const birth=discBirth(i);
+    if(!isExit&&f<birth) continue;
+
+    const v_v=GEO_VERTS_V[i], v_h=GEO_VERTS_H[i];
+    const v={
+      x:v_v.x+(v_h.x-v_v.x)*morphT,
+      y:v_v.y+(v_h.y-v_v.y)*morphT,
+      z:0
+    };
+    // Scale E discs around E's own center
+    const isELetter=i<eRange.end;
+    let vs=v;
+    if(isELetter&&eScale!==1.0){
+      const ecx=0;
+      const ecy=eVertY+(0-eVertY)*morphT; // morph center too
+      vs={x:ecx+(v.x-ecx)*eScale, y:ecy+(v.y-ecy)*eScale, z:v.z};
+    }
+    const fin=project(vs.x,vs.y,vs.z);
+
+    // --- INTRO flight (phase 1 + 2) ---
+    if(f<P2_END){
+      const age=f-birth;
+      if(age<0) continue;
+      const flyT=Math.min(1,age/TRAIL_LIFE);
+      const easeT=1-(1-flyT)*(1-flyT);
+
+      const startMul=isELetter?3.0:2.5;
+      const start=project(vs.x*startMul,vs.y*(isELetter?2.0:1.5),vs.z);
+      const curX=start.x+(fin.x-start.x)*easeT;
+      const curY=start.y+(fin.y-start.y)*easeT;
+      const curZ=start.z+(fin.z-start.z)*easeT;
+
+      if(flyT>=1){
+        result.push({id:i,x:fin.x,y:fin.y,z:fin.z,isE:true,isGhost:false});
+      } else {
+        result.push({id:i,x:curX,y:curY,z:curZ,isE:true,isGhost:false});
+        for(let g=1;g<=2;g++){
+          const gt=Math.max(0,easeT-g*0.12);
+          const gx=start.x+(fin.x-start.x)*gt;
+          const gy=start.y+(fin.y-start.y)*gt;
+          const gz=start.z+(fin.z-start.z)*gt;
+          result.push({id:i,x:gx,y:gy,z:gz-g*0.01,isE:true,isGhost:true,ghostDepth:g});
+        }
+      }
+      continue;
+    }
+
+    // --- EXIT flight ---
+    if(isExit){
+      const ep=exitProgress(i);
+      if(ep>=1) continue;
+      const easeOut=ep*ep*ep;
+      const dx=fin.x-CX,dy=fin.y-CY;
+      const dist=Math.sqrt(dx*dx+dy*dy)||1;
+      const spinAngle=easeOut*1.5;
+      const cs=Math.cos(spinAngle),sn=Math.sin(spinAngle);
+      const rdx=dx*cs-dy*sn,rdy=dx*sn+dy*cs;
+      const flyDist=400*easeOut;
+      const curX=fin.x+rdx/dist*flyDist;
+      const curY=fin.y+rdy/dist*flyDist;
+      // Skip if offscreen
+      if(curX<-60||curX>C64W+60||curY<-60||curY>C64H+60) continue;
+      result.push({id:i,x:curX,y:curY,z:fin.z,isE:true,isGhost:false});
+      for(let g=1;g<=2;g++){
+        const gep=Math.max(0,easeOut-g*0.06);
+        const gfd=400*gep;
+        const gsa=gep*1.5;
+        const gcs=Math.cos(gsa),gsn=Math.sin(gsa);
+        const gdx=dx*gcs-dy*gsn,gdy=dx*gsn+dy*gcs;
+        result.push({id:i,x:fin.x+gdx/dist*gfd,y:fin.y+gdy/dist*gfd,z:fin.z-g*0.01,isE:true,isGhost:true,ghostDepth:g});
+      }
+      continue;
+    }
+
+    // --- NORMAL (rotation) ---
+    // Skip discs far offscreen
+    const margin=40;
+    const onScreen=fin.x>-margin&&fin.x<C64W+margin&&fin.y>-margin&&fin.y<C64H+margin;
+    if(!onScreen) continue;
+    result.push({id:i,x:fin.x,y:fin.y,z:fin.z,isE:true,isGhost:false});
+  }
+  } // end EXTEND skip
+
+
+  // Set glitch color globals for discColor
+  _glitchColorActive=glitchRand(f*17+7)>0.92;
+  _glitchFrame=f;
+
+  result.sort((a,b)=>a.z-b.z);
+  return result;
+}
+
+// ============================================================
+// Generic allocator: mux-aware, least-error fallback
+// Promotes conflicting circles to sprites greedily, but checks
+// mux fit before each promotion. If mux is full, remaining
+// conflicts stay as chars (corruption = least error vs invisible).
+// ============================================================
+function tryMuxFit(spriteList){
+  // Returns true if all sprites in the list can be assigned mux slots
+  const infos=spriteList.map((s,i)=>({i,topY:Math.floor(s.y)-8})).sort((a,b)=>a.topY-b.topY);
+  const slots=new Int16Array(8).fill(-999);
+  for(const si of infos){
+    let ok=false;
+    for(let s=0;s<8;s++){if(slots[s]<=si.topY){slots[s]=si.topY+MUX_H;ok=true;break;}}
+    if(!ok)return false;
+  }
+  return true;
+}
+
+function allocate(positions){
+  const n=positions.length;
+  if(!n)return{asgn:[],slCounts:new Uint8Array(C64H),maxSL:0,muxOverflows:0,muxUsed:0,conflicts:0,spriteSlotMap:new Map()};
+
+  // Discard off-screen circles; include those with visible stamp cells
+  // Edge discs (near screen boundary) included even without cells → forced to sprite
+  const vis=[],visIdx=[],forceSprite=[];
+  for(let i=0;i<n;i++){
+    const p=positions[i];
+    if(p.x>=-12&&p.x<C64W+12&&p.y>=-12&&p.y<C64H+12){
+      const cells=getStampCells(p.x,p.y);
+      const nearEdge=p.y<12||p.y>C64H-12||p.x<12||p.x>C64W-12;
+      if(cells.length>0){
+        vis.push({...p});visIdx.push(i);forceSprite.push(nearEdge&&cells.length<=2);
+      } else if(nearEdge){
+        // No stamp cells but sprite can still render partial pixels
+        vis.push({...p});visIdx.push(i);forceSprite.push(true);
+      }
+    }
+  }
+
+  const stampData=vis.map(p=>getStampCells(p.x,p.y));
+  const mode=new Array(vis.length).fill('char');
+  const spriteVis=[];
+
+  // Force edge discs to sprite immediately
+  for(let i=0;i<vis.length;i++){
+    if(forceSprite[i]){
+      const testList=[...spriteVis.map(vi=>vis[vi]),vis[i]];
+      if(tryMuxFit(testList)){
+        mode[i]='sprite';
+        spriteVis.push(i);
+      }
+    }
+  }
+
+  // Build cell->owners conflict counts for char-mode circles
+  function buildConflicts(){
+    const cellOwners=new Map();
+    for(let i=0;i<vis.length;i++){
+      if(mode[i]!=='char')continue;
+      for(const s of stampData[i]){
+        const k=s.row*100+s.col;
+        if(!cellOwners.has(k))cellOwners.set(k,[]);
+        cellOwners.get(k).push(i);
+      }
+    }
+    const cc=new Uint16Array(vis.length);
+    cellOwners.forEach(owners=>{
+      if(owners.length>1)for(const o of owners)cc[o]+=owners.length-1;
+    });
+    return cc;
+  }
+
+  // Greedy promote with mux check
+  for(let iter=0;iter<vis.length;iter++){
+    const cc=buildConflicts();
+    const cands=[];
+    for(let i=0;i<vis.length;i++){
+      if(mode[i]==='char'&&cc[i]>0)cands.push({i,c:cc[i]});
+    }
+    if(!cands.length)break;
+    cands.sort((a,b)=>b.c-a.c);
+
+    let promoted=false;
+    for(const cand of cands){
+      // Test if this sprite would fit in mux
+      const testList=[...spriteVis.map(vi=>vis[vi]),vis[cand.i]];
+      if(tryMuxFit(testList)){
+        mode[cand.i]='sprite';
+        spriteVis.push(cand.i);
+        promoted=true;
+        break;
+      }
+    }
+    if(!promoted)break; // mux full, accept remaining as char corruption
+  }
+
+  // Nudge pass: shift conflicting char discs by ±1-2px to avoid cell overlaps
+  {
+    const _OFFSETS=[[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,-1],[-1,1],[1,1],[-2,0],[2,0],[0,-2],[0,2]];
+    for(let nr=0;nr<3;nr++){
+      let improved=false;
+      const co=new Map();
+      for(let i=0;i<vis.length;i++){
+        if(mode[i]!=='char')continue;
+        for(const s of stampData[i]){const k=s.row*100+s.col;if(!co.has(k))co.set(k,[]);co.get(k).push(i);}
+      }
+      const cds=new Set();
+      co.forEach(o=>{if(o.length>1)for(const x of o)cds.add(x);});
+      for(const di of cds){
+        if(mode[di]!=='char')continue;
+        let cur=0;
+        for(const s of stampData[di]){const k=s.row*100+s.col;const o=co.get(k);if(o&&o.length>1)cur++;}
+        if(!cur)continue;
+        let bestOff=null,bestC=cur,bestS=null;
+        const ox=vis[di].x,oy=vis[di].y;
+        for(const [dx,dy] of _OFFSETS){
+          const ns=getStampCells(ox+dx,oy+dy);
+          if(!ns.length)continue;
+          let nc=0;
+          for(const s of ns){const k=s.row*100+s.col;const o=co.get(k);if(o){const oc=o.filter(x=>x!==di).length;if(oc>0)nc++;}}
+          if(nc<bestC){bestC=nc;bestOff=[dx,dy];bestS=ns;}
+        }
+        if(bestOff&&bestC<cur){
+          for(const s of stampData[di]){const k=s.row*100+s.col;const o=co.get(k);if(o){const idx=o.indexOf(di);if(idx>=0)o.splice(idx,1);}}
+          vis[di].x=ox+bestOff[0];vis[di].y=oy+bestOff[1];stampData[di]=bestS;
+          for(const s of bestS){const k=s.row*100+s.col;if(!co.has(k))co.set(k,[]);co.get(k).push(di);}
+          improved=true;
+        }
+      }
+      if(!improved)break;
+    }
+  }
+
+  // Build full assignment array
+  const asgn=positions.map(p=>({...p,mode:'offscreen',stamp:[]}));
+  for(let vi=0;vi<vis.length;vi++){
+    const gi=visIdx[vi];
+    asgn[gi].mode=mode[vi];
+    asgn[gi].stamp=stampData[vi];
+    asgn[gi].x=vis[vi].x;
+    asgn[gi].y=vis[vi].y;
+  }
+
+  // Count remaining char conflicts
+  let charConflicts=0;
+  {const cm=new Map();
+   for(let i=0;i<asgn.length;i++){
+     if(asgn[i].mode!=='char')continue;
+     for(const s of asgn[i].stamp){const k=s.row*100+s.col;if(!cm.has(k))cm.set(k,[]);cm.get(k).push(i);}
+   }
+   cm.forEach(owners=>{if(owners.length>1)charConflicts++;});
+  }
+
+  // Final mux simulation (all sprites guaranteed to fit)
+  const spriteInfos=[];
+  asgn.forEach((a,ai)=>{
+    if(a.mode!=='sprite')return;
+    const topY=Math.floor(a.y)-8;
+    spriteInfos.push({idx:ai,topY,endY:topY+MUX_H});
+  });
+  spriteInfos.sort((a,b)=>a.topY-b.topY);
+
+  const slotFreeAt=new Int16Array(8).fill(-999);
+  let muxUsed=0;
+  const spriteSlotMap=new Map();
+  spriteInfos.forEach(si=>{
+    for(let s=0;s<8;s++){
+      if(slotFreeAt[s]<=si.topY){slotFreeAt[s]=si.topY+MUX_H;spriteSlotMap.set(si.idx,s);muxUsed=Math.max(muxUsed,s+1);break;}
+    }
+  });
+
+  const slCounts=new Uint8Array(C64H);
+  spriteInfos.forEach(si=>{
+    const slot=spriteSlotMap.get(si.idx);if(slot===undefined)return;
+    const top=Math.max(0,si.topY),bot=Math.min(C64H-1,si.topY+SPRITE_H-1);
+    for(let sl=top;sl<=bot;sl++)slCounts[sl]++;
+  });
+  let maxSL=0;for(let i=0;i<C64H;i++)maxSL=Math.max(maxSL,slCounts[i]);
+
+  return{asgn,slCounts,maxSL,muxOverflows:0,muxUsed,conflicts:charConflicts,spriteSlotMap};
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+const COL_BG=[0,0,0],COL_CHAR=[81,207,102],COL_SPR=[255,107,107],COL_WHITE=[219,219,219];
+// Shell depth ramp: cyan front → black back (6 shades)
+const COL_S_CYAN=[180,180,180];
+const COL_S_LTBLUE=[104,174,255];
+const COL_S_PURPLE=[100,130,180];  // steel blue
+const COL_S_BLUE=[60,60,200];
+const COL_S_DKBLUE=[20,20,120];
+// black = culled (FADE_CUTOFF)
+
+const FADE_CUTOFF=0.85;
+
+
+
+// Color shades ordered dark→bright for scanline shifting
+const SHADE_RAMP=[[8,10,50], COL_S_DKBLUE, COL_S_BLUE, COL_S_PURPLE, COL_S_LTBLUE, COL_S_CYAN, [219,219,219]];
+
+let _glitchColorActive=false, _glitchFrame=0;
+
+function discColor(a){
+  // Color glitch: randomly swap shade index
+  if(_glitchColorActive){
+    const gr=((a.id*53+_glitchFrame*31)&0x7fffffff)%100;
+    if(gr<15){ // 15% of discs get wrong color
+      const wrongIdx=((a.id*97+_glitchFrame*13)&0x7fffffff)%SHADE_RAMP.length;
+      return SHADE_RAMP[wrongIdx];
+    }
+  }
+
+  let baseIdx;
+  if(a.isGhost){
+    const d=a.ghostDepth||1;
+    if(d<=1) baseIdx=2; // BLUE
+    else if(d<=2) baseIdx=1; // DKBLUE
+    else baseIdx=0; // darkest
+  } else {
+    const z=a.z;
+    if(z<=-0.3) baseIdx=5; // CYAN
+    else if(z<=-0.1) baseIdx=4; // LTBLUE
+    else if(z<=0.1) baseIdx=3; // PURPLE
+    else if(z<=0.3) baseIdx=2; // BLUE
+    else baseIdx=1; // DKBLUE
+  }
+
+  const idx=Math.max(0, Math.min(SHADE_RAMP.length-1, baseIdx));
+  const lo=Math.floor(idx), hi=Math.min(SHADE_RAMP.length-1, lo+1);
+  const frac=idx-lo;
+  const clo=SHADE_RAMP[lo], chi=SHADE_RAMP[hi];
+  return [
+    Math.round(clo[0]+(chi[0]-clo[0])*frac),
+    Math.round(clo[1]+(chi[1]-clo[1])*frac),
+    Math.round(clo[2]+(chi[2]-clo[2])*frac)
+  ];
+}
+
+function shouldSkip(a){
+  if(a.z > FADE_CUTOFF) return true;
+  return false;
+}
+
+function drawFrame(){
+  const positions=genPositions(frame);
+  const visPositions=positions.filter(p=>!shouldSkip(p));
+  const res=allocate(visPositions);
+  const{asgn,slCounts,maxSL,muxOverflows,muxUsed,conflicts,spriteSlotMap}=res;
+
+  // Cumulative corruption counter, resets at loop start
+  if(frame===0){corruptTotal=0;accumMemBytes=0;peakFrameBytes=0;}
+  if(frame!==lastCorruptFrame){corruptTotal+=conflicts;lastCorruptFrame=frame;}
+  document.getElementById('corruptDisplay').textContent=`Corrupt: ${corruptTotal}`;
+
+  const d=offImg.data;
+  for(let i=0;i<d.length;i+=4){d[i]=0;d[i+1]=0;d[i+2]=0;d[i+3]=255;}
+
+  // Screen RAM with color RAM — single pass back-to-front
+  const screenRAM=new Int16Array(ROWS*COLS).fill(EMPTY_IDX);
+  const screenOwner=new Int16Array(ROWS*COLS).fill(-1);
+  const screenOver=new Uint8Array(ROWS*COLS);
+  const colorRAM=new Array(ROWS*COLS).fill(null);
+
+  // Single char pass: iterate back-to-front (index 0=most behind, last=most front)
+  for(let ai=0;ai<asgn.length;ai++){
+    const a=asgn[ai];
+    if(a.mode!=='char')continue;
+    const col=discColor(a);
+    a.stamp.forEach(cell=>{
+      const idx=cell.row*COLS+cell.col;
+      if(screenOwner[idx]>=0&&screenOwner[idx]!==ai)screenOver[idx]++;
+      screenRAM[idx]=cell.ch;screenOwner[idx]=ai;
+      colorRAM[idx]=col;
+    });
+  }
+
+  // Build char foreground mask for sprite-background priority
+  const charMask=new Uint8Array(C64W*C64H);
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      const chIdx=screenRAM[r*COLS+c];
+      if(chIdx===EMPTY_IDX)continue;
+      const cpx=charPixels[chIdx];
+      const bx=c*CHW,by=r*CHH;
+      for(let py=0;py<8;py++)for(let px=0;px<8;px++){
+        if(cpx[py*8+px]){const sx=bx+px,sy=by+py;if(sx<C64W&&sy<C64H)charMask[sy*C64W+sx]=1;}
+      }
+    }
+  }
+
+  // Helper to render a sprite
+  function renderSprite(a,col,bgPriority){
+    const ox=Math.floor(a.x)-8,oy=Math.floor(a.y)-8;
+    for(let sr=0;sr<SPRITE_H;sr++){
+      const sy=oy+sr;
+      if(sy<0||sy>=C64H)continue;
+      for(let sc=0;sc<SPRITE_W;sc++){
+        if(!sprPixels[sr*SPRITE_W+sc])continue;
+        const sx=ox+sc;
+        if(sx<0||sx>=C64W)continue;
+        // Background priority: char fg pixels appear in front of sprite
+        if(bgPriority&&charMask[sy*C64W+sx])continue;
+        const idx=(sy*C64W+sx)*4;
+        d[idx]=col[0];d[idx+1]=col[1];d[idx+2]=col[2];
+      }
+    }
+  }
+
+  // Single sprite pass: back sprites behind chars, front sprites on top
+  for(let ai=0;ai<asgn.length;ai++){
+    const a=asgn[ai];
+    if(a.mode!=='sprite')continue;
+    const slot=spriteSlotMap.get(ai);
+    const hasSlot=slot!==undefined&&slot>=0;
+    let col;
+    if(opts.c64only||!opts.color){col=hasSlot?discColor(a):null;}
+    else{col=hasSlot?COL_SPR:[100,30,30];}
+    const bgPriority=a.z>0; // back discs behind char layer
+    if(col)renderSprite(a,col,bgPriority);
+  }
+
+  // Pass 2: Chars
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      const chIdx=screenRAM[r*COLS+c],cpx=charPixels[chIdx];
+      const bx=c*CHW,by=r*CHH;
+      const wasOver=screenOver[r*COLS+c]>0;
+      let fg,bg;
+      const cellColor=colorRAM[r*COLS+c];
+      if(opts.c64only){fg=cellColor||COL_WHITE;bg=COL_BG;}
+      else if(opts.color&&wasOver&&opts.corruption){fg=[255,212,59];bg=[60,40,0];}
+      else if(opts.color){fg=COL_CHAR;bg=COL_BG;}
+      else{fg=COL_WHITE;bg=COL_BG;}
+      const showEmpty=opts.grid&&!opts.c64only;
+      const emptyBg=[40,20,60];
+      for(let py=0;py<8;py++)for(let px=0;px<8;px++){
+        const sx=bx+px,sy=by+py;
+        if(sx<C64W&&sy<C64H){const idx=(sy*C64W+sx)*4;
+          if(cpx[py*8+px]){d[idx]=fg[0];d[idx+1]=fg[1];d[idx+2]=fg[2];}
+          else if(wasOver&&opts.corruption&&!opts.c64only){d[idx]=bg[0];d[idx+1]=bg[1];d[idx+2]=bg[2];}
+          else if(showEmpty&&chIdx!==EMPTY_IDX){d[idx]=emptyBg[0];d[idx+1]=emptyBg[1];d[idx+2]=emptyBg[2];}
+        }
+      }
+    }
+  }
+
+  offCtx.putImageData(offImg,0,0);
+  mainCtx.imageSmoothingEnabled=false;
+  mainCtx.drawImage(offC,0,0,C64W,C64H,0,0,C64W*SCALE,C64H*SCALE);
+
+  // Overlays
+  if(!opts.c64only){
+    const ctx=mainCtx;
+    if(opts.grid){ctx.strokeStyle='rgba(40,40,70,0.3)';ctx.lineWidth=1;
+      for(let c=1;c<COLS;c++){ctx.beginPath();ctx.moveTo(c*CHW*SCALE,0);ctx.lineTo(c*CHW*SCALE,C64H*SCALE);ctx.stroke();}
+      for(let r=1;r<ROWS;r++){ctx.beginPath();ctx.moveTo(0,r*CHH*SCALE);ctx.lineTo(C64W*SCALE,r*CHH*SCALE);ctx.stroke();}}
+    if(opts.corruption){for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+      if(screenOver[r*COLS+c]>0){ctx.strokeStyle='rgba(255,212,59,0.5)';ctx.lineWidth=1;ctx.strokeRect(c*CHW*SCALE+.5,r*CHH*SCALE+.5,CHW*SCALE-1,CHH*SCALE-1);}}}
+    if(opts.mux){asgn.forEach((a,ai)=>{
+      if(a.mode!=='sprite')return;
+      const slot=spriteSlotMap.get(ai);if(slot===undefined||slot<0)return;
+      const topY=Math.floor(a.y)-8;
+      ctx.fillStyle=`hsla(${slot*45},60%,50%,0.12)`;ctx.fillRect(0,topY*SCALE,C64W*SCALE,MUX_H*SCALE);
+      ctx.fillStyle=`hsla(${slot*45},60%,60%,0.5)`;ctx.font='9px JetBrains Mono';ctx.textAlign='left';ctx.fillText(`S${slot}`,2,(topY+6)*SCALE);});}
+    if(opts.ids){ctx.font='bold 14px JetBrains Mono';ctx.textAlign='center';ctx.textBaseline='middle';
+      asgn.forEach(a=>{if(a.mode==='offscreen')return;ctx.fillStyle=a.mode==='sprite'?'#f44':'#3c5';ctx.fillText(String(a.id),a.x*SCALE,a.y*SCALE);});}
+  }
+
+  // Stats
+  const sprN=asgn.filter(a=>a.mode==='sprite').length;
+  const chrN=asgn.filter(a=>a.mode==='char').length;
+  const visN=asgn.filter(a=>a.mode!=='offscreen').length;
+  document.getElementById('statTotal').textContent=asgn.length;
+  document.getElementById('statVisible').textContent=visN;
+  document.getElementById('statSprites').textContent=sprN;
+  document.getElementById('statChars').textContent=chrN;
+  document.getElementById('statConflicts').textContent=conflicts;
+  document.getElementById('statConflicts').className=`stat-value ${conflicts>0?'warn':'ok'}`;
+  document.getElementById('statMaxSL').textContent=maxSL;
+  document.getElementById('statMaxSL').className=`stat-value ${maxSL>MAX_SPR_LINE?'warn':'sprite'}`;
+  document.getElementById('statMuxOver').textContent=muxOverflows;
+  document.getElementById('statMuxOver').className=`stat-value ${muxOverflows>0?'warn':'ok'}`;
+  document.getElementById('statMuxUsed').textContent=`${muxUsed}/8`;
+  // Memory usage: pixel-level occlusion — only count discs that contribute ≥1 new pixel
+  // Sort front-to-back (highest z = frontmost, rendered last = on top)
+  // Then paint pixels; if a disc adds zero new pixels it's fully occluded → cull
+  const memPositions=[...positions].filter(p=>{
+    const ox=Math.round(p.x)-8, oy=Math.round(p.y)-8;
+    return ox+16>0&&ox<C64W&&oy+15>0&&oy<C64H;
+  });
+  memPositions.sort((a,b)=>b.z-a.z); // front-to-back
+  const screenClaimed=new Uint8Array(C64W*C64H);
+  let memDiscs=0, onScreenCount=memPositions.length;
+  for(const p of memPositions){
+    const ox=Math.round(p.x)-8, oy=Math.round(p.y)-8;
+    let newPixels=0;
+    for(let sr=0;sr<SPRITE_H;sr++){
+      const sy=oy+sr;
+      if(sy<0||sy>=C64H) continue;
+      for(let sc=0;sc<SPRITE_W;sc++){
+        if(!sprPixels[sr*SPRITE_W+sc]) continue;
+        const sx=ox+sc;
+        if(sx<0||sx>=C64W) continue;
+        const idx=sy*C64W+sx;
+        if(!screenClaimed[idx]){
+          screenClaimed[idx]=1;
+          newPixels++;
+        }
+      }
+    }
+    if(newPixels>0) memDiscs++;
+  }
+  const memBytes=memDiscs*3;
+  accumMemBytes+=memBytes;
+  if(memBytes>peakFrameBytes) peakFrameBytes=memBytes;
+  document.getElementById('statMemDiscs').textContent=`${memDiscs} (${onScreenCount} raw)`;
+  document.getElementById('statMemBytes').textContent=`${memBytes} B`;
+  const kb=(accumMemBytes/1024).toFixed(1);
+  document.getElementById('statMemPeak').textContent=`${accumMemBytes} B (${kb} KB)`;
+
+  document.getElementById('frameDisplay').textContent=`Frame ${frame} / ${totalFrames}`;
+
+  let phase='Geosphere rotation';
+  document.getElementById('phaseLabel').textContent=phase;
+
+  drawScanline(slCounts);drawTimeline();
+}
+
+function drawScanline(counts){
+  const ctx=scanCtx,w=scanC.width,h=scanC.height;
+  ctx.fillStyle='#0a0a10';ctx.fillRect(0,0,w,h);
+  const maxV=Math.max(MAX_SPR_LINE+2,...counts);
+  const limY=h-(MAX_SPR_LINE/maxV)*h;
+  ctx.fillStyle='rgba(255,107,107,0.1)';ctx.fillRect(0,0,w,limY);
+  ctx.strokeStyle='rgba(255,107,107,0.3)';ctx.lineWidth=1;
+  ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(0,limY);ctx.lineTo(w,limY);ctx.stroke();ctx.setLineDash([]);
+  ctx.fillStyle='rgba(255,107,107,0.4)';ctx.font='8px JetBrains Mono';ctx.textAlign='right';ctx.fillText('8',w-3,limY-2);
+  const bw=w/C64H;
+  for(let i=0;i<C64H;i++){if(!counts[i])continue;const bh=(counts[i]/maxV)*h;
+    ctx.fillStyle=counts[i]>MAX_SPR_LINE?'rgba(255,212,59,0.7)':'rgba(255,107,107,0.5)';ctx.fillRect(i*bw,h-bh,Math.max(1,bw-.5),bh);}
+}
+
+function drawTimeline(){
+  const ctx=tlCtx,w=tlC.width,h=tlC.height;
+  ctx.fillStyle='#111118';ctx.fillRect(0,0,w,h);
+  const ph=[{s:0,e:64,c:'#443355',l:'E zooms in'},{s:64,e:128,c:'#335544',l:'XTEND appears'},{s:128,e:256,c:'#334455',l:'E→D pan'},{s:256,e:304,c:'#553344',l:'exit'},];
+  ph.forEach(p=>{const x0=(p.s/totalFrames)*w,x1=(p.e/totalFrames)*w;ctx.fillStyle=p.c;ctx.fillRect(x0,0,x1-x0,h);
+    ctx.fillStyle='#667';ctx.font='8px JetBrains Mono';ctx.textAlign='center';ctx.fillText(p.l,(x0+x1)/2,h/2+3);});
+  ctx.fillStyle='#6c6cff';ctx.fillRect((frame/totalFrames)*w-1,0,3,h);
+  ctx.strokeStyle='#1a1a25';ctx.strokeRect(0,0,w,h);
+}
+
+// Controls
+document.getElementById('btnPlay').onclick=()=>{playing=!playing;document.getElementById('btnPlay').textContent=playing?'⏸ Pause':'▶ Play';document.getElementById('btnPlay').classList.toggle('active',playing);if(playing){lastTime=performance.now();accum=0;requestAnimationFrame(loop);}};
+function advanceFrame(){frame++;if(frame>=totalFrames)frame=0;}
+document.getElementById('btnStep').onclick=()=>{advanceFrame();drawFrame();};
+document.getElementById('btnReset').onclick=()=>{frame=0;playing=false;document.getElementById('btnPlay').textContent='▶ Play';document.getElementById('btnPlay').classList.remove('active');drawFrame();};
+document.getElementById('speedSlider').oninput=e=>{speed=parseFloat(e.target.value);document.getElementById('speedLabel').textContent=speed.toFixed(1)+'×';};
+tlC.onclick=e=>{const r=tlC.getBoundingClientRect();frame=Math.max(0,Math.min(totalFrames-1,Math.floor(((e.clientX-r.left)/r.width)*totalFrames)));drawFrame();};
+function tog(o){opts[o]=!opts[o];document.getElementById('opt'+o.charAt(0).toUpperCase()+o.slice(1)).classList.toggle('active',opts[o]);drawFrame();}
+function loop(ts){if(!playing)return;accum+=(ts-lastTime)*speed;lastTime=ts;const ft=1000/FPS;while(accum>=ft){advanceFrame();accum-=ft;}drawFrame();requestAnimationFrame(loop);}
+drawFrame();
+// Autoplay
+document.getElementById('btnPlay').textContent='⏸ Pause';
+document.getElementById('btnPlay').classList.add('active');
+lastTime=performance.now();accum=0;requestAnimationFrame(loop);
+</script>
+</body>
+</html>
