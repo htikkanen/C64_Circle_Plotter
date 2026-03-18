@@ -15,16 +15,9 @@ struct C64App {
     corrupt_total: u32,
     last_corrupt_frame: Option<usize>,
     accum_mem_bytes: usize,
-    peak_frame_bytes: usize,
-
-    // Precomputed data
-    spr_pixels: [u8; data::SPRITE_W * data::SPRITE_H],
-    char_pixels: [[u8; 64]; 256],
 
     // Rendering state
     texture: Option<egui::TextureHandle>,
-    last_stats: Option<render::FrameStats>,
-    last_sl_counts: Vec<u8>,
 
     // Timing
     last_time: Option<f64>,
@@ -48,12 +41,7 @@ impl C64App {
             corrupt_total: 0,
             last_corrupt_frame: None,
             accum_mem_bytes: 0,
-            peak_frame_bytes: 0,
-            spr_pixels: *data::SPR_PIXELS,
-            char_pixels: *data::CHAR_PIXELS,
             texture: None,
-            last_stats: None,
-            last_sl_counts: vec![0u8; data::C64H],
             last_time: None,
             accum: 0.0,
         }
@@ -72,7 +60,6 @@ impl C64App {
         self.corrupt_total = 0;
         self.last_corrupt_frame = None;
         self.accum_mem_bytes = 0;
-        self.peak_frame_bytes = 0;
         self.last_time = None;
         self.accum = 0.0;
     }
@@ -83,27 +70,19 @@ impl C64App {
         if self.frame == 0 {
             self.corrupt_total = 0;
             self.accum_mem_bytes = 0;
-            self.peak_frame_bytes = 0;
         }
 
         let positions = sim::gen_positions(self.frame);
         let (pixels, stats, sl_counts) = render::render_frame(
             &positions,
-            &self.spr_pixels,
-            &self.char_pixels,
             &self.opts,
         );
 
-        // Update corruption counter (only once per frame)
+        // Update counters (only once per frame — avoids inflation on repaints)
         if self.last_corrupt_frame != Some(self.frame) {
             self.corrupt_total += stats.conflicts;
+            self.accum_mem_bytes += stats.mem_bytes;
             self.last_corrupt_frame = Some(self.frame);
-        }
-
-        // Accumulate memory stats
-        self.accum_mem_bytes += stats.mem_bytes;
-        if stats.mem_bytes > self.peak_frame_bytes {
-            self.peak_frame_bytes = stats.mem_bytes;
         }
 
         (pixels, stats, sl_counts)
@@ -113,10 +92,13 @@ impl C64App {
 // ---------------------------------------------------------------------------
 // Color constants
 // ---------------------------------------------------------------------------
-const COL_PHASE_1: egui::Color32 = egui::Color32::from_rgb(0x44, 0x33, 0x55);
-const COL_PHASE_2: egui::Color32 = egui::Color32::from_rgb(0x33, 0x55, 0x44);
-const COL_PHASE_3: egui::Color32 = egui::Color32::from_rgb(0x33, 0x44, 0x55);
-const COL_PHASE_4: egui::Color32 = egui::Color32::from_rgb(0x55, 0x33, 0x44);
+/// Phase metadata: (start_frame, end_frame, color, label)
+const PHASES: [(usize, usize, egui::Color32, &str); 4] = [
+    (0, data::P1_END, egui::Color32::from_rgb(0x44, 0x33, 0x55), "E zooms in"),
+    (data::P1_END, data::P2_END, egui::Color32::from_rgb(0x33, 0x55, 0x44), "XTEND appears"),
+    (data::P2_END, data::P3_END, egui::Color32::from_rgb(0x33, 0x44, 0x55), "E->D pan"),
+    (data::P3_END, data::P4_END, egui::Color32::from_rgb(0x55, 0x33, 0x44), "exit"),
+];
 
 // Theme colors
 const COL_BG: egui::Color32 = egui::Color32::from_rgb(0x0a, 0x0a, 0x0e);
@@ -154,8 +136,6 @@ impl eframe::App for C64App {
 
         // --- Render the C64 frame ---
         let (pixels, stats, sl_counts) = self.render_current_frame();
-        self.last_stats = Some(stats.clone());
-        self.last_sl_counts = sl_counts.clone();
 
         // Build / update texture
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -182,15 +162,13 @@ impl eframe::App for C64App {
         });
 
         // --- Right sidebar ---
-        let sidebar_stats = stats.clone();
-        let sidebar_sl = sl_counts.clone();
         egui::SidePanel::right("sidebar")
             .default_width(280.0)
             .min_width(240.0)
             .show(ctx, |ui| {
                 ui.style_mut().visuals.panel_fill = egui::Color32::from_rgb(0x0e, 0x0e, 0x14);
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.draw_sidebar(ui, &sidebar_stats, &sidebar_sl);
+                    self.draw_sidebar(ui, &stats, &sl_counts);
                 });
             });
 
@@ -302,14 +280,7 @@ impl C64App {
         let rect = response.rect;
 
         // Phase segments
-        let phases: &[(usize, usize, egui::Color32, &str)] = &[
-            (0, data::P1_END, COL_PHASE_1, "E zooms in"),
-            (data::P1_END, data::P2_END, COL_PHASE_2, "XTEND appears"),
-            (data::P2_END, data::P3_END, COL_PHASE_3, "E->D pan"),
-            (data::P3_END, data::P4_END, COL_PHASE_4, "exit"),
-        ];
-
-        for &(s, e, color, label) in phases {
+        for &(s, e, color, label) in &PHASES {
             let x0 = rect.left() + (s as f32 / data::TOTAL_FRAMES as f32) * rect.width();
             let x1 = rect.left() + (e as f32 / data::TOTAL_FRAMES as f32) * rect.width();
             let phase_rect = egui::Rect::from_min_max(
@@ -419,6 +390,20 @@ impl C64App {
             ui.columns(2, |cols| {
                 option_toggle(&mut cols[0], "C64 only", &mut self.opts.c64only);
                 option_toggle(&mut cols[1], "Mux zones", &mut self.opts.mux);
+            });
+            ui.columns(2, |cols| {
+                option_toggle(&mut cols[0], "Chars", &mut self.opts.show_chars);
+                option_toggle(&mut cols[1], "Sprites", &mut self.opts.show_sprites);
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.colored_label(COL_DIM, egui::RichText::new("Prune dist").size(10.0));
+                let slider = egui::Slider::new(&mut self.opts.prune_dist, 0.0..=8.0)
+                    .step_by(0.5)
+                    .custom_formatter(|v, _| {
+                        if v == 0.0 { "off".to_string() } else { format!("{:.1}px", v) }
+                    });
+                ui.add(slider);
             });
         });
     }
@@ -549,17 +534,12 @@ fn option_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) {
 }
 
 fn phase_label(frame: usize) -> &'static str {
-    if frame < data::P1_END {
-        "E zooms in"
-    } else if frame < data::P2_END {
-        "XTEND appears"
-    } else if frame < data::P3_END {
-        "E -> D pan"
-    } else if frame < data::P4_END {
-        "exit"
-    } else {
-        "--"
+    for &(s, e, _, label) in &PHASES {
+        if frame >= s && frame < e {
+            return label;
+        }
     }
+    "--"
 }
 
 // ---------------------------------------------------------------------------

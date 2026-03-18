@@ -21,10 +21,10 @@ pub struct DiscPosition {
 pub struct StampCellPos {
     pub row: i32,
     pub col: i32,
-    pub ch: u8,
+    pub ch: u16,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DiscMode {
     Char,
     Sprite,
@@ -63,8 +63,13 @@ pub struct FramePositions {
 // Constants
 // ---------------------------------------------------------------------------
 
-const CX: f64 = 160.0;
-const CY: f64 = 100.0;
+/// A char cell is considered "masked" by sprites if this many pixels are covered.
+const MASK_THRESHOLD: u16 = 32; // 50% of 8x8 cell
+
+// Offset by (-3, -2) to compensate for the circle bitmap center being at
+// pixel (11, 10) within the 24x21 sprite, with render offset -8.
+const CX: f64 = 157.0;
+const CY: f64 = 98.0;
 const GEO_R: f64 = 85.0;
 const GEO_DIST: f64 = 400.0;
 const F_END: f64 = 256.0;
@@ -165,10 +170,6 @@ struct GeoData {
     verts_h: Vec<Vert>,
     letter_ranges: Vec<LetterRange>,
     n_verts: usize,
-    #[allow(dead_code)]
-    mid_vy: f64,
-    #[allow(dead_code)]
-    mid_hx: f64,
     e_vert_y: f64,
     d_vert_y: f64,
     e_vert_x: f64,
@@ -249,7 +250,6 @@ fn build_geo_data() -> GeoData {
         for (r, cols) in letter_rows.iter().enumerate() {
             for &c in cols {
                 // Vertical layout vertex
-                let _vy = (row_offset + r as i32 + 3) as f64 - mid_vy;
                 // For the vertical layout x: all letters are centered at x=0
                 // but each dot's column offset is relative to the letter.
                 // In the JS, vertical layout still uses the *horizontal* mid:
@@ -313,22 +313,18 @@ fn build_geo_data() -> GeoData {
 
     let n_verts = verts_v.len();
 
-    let cell = 0.0595_f64;
-    let mid_vy_val = (ly - 3 + 6) as f64 / 2.0;
-    let total_w = 47.0_f64;
-    let mid_hx_val = (total_w - 1.0) / 2.0;
-    let e_vert_y = (3.0 - mid_vy_val) * cell;
-    let d_vert_y = (53.0 - mid_vy_val) * cell;
-    let e_vert_x = (0.0 + 3.0 - mid_hx_val) * cell;
-    let d_vert_x = (40.0 + 3.0 - mid_hx_val) * cell;
+    // Center on the middle row (r=3) of each letter, not the first row.
+    // Vertex y = (row_offset + r + 3 - mid_vy) * CELL, so center = row_offset + 3 + 3.
+    let e_vert_y = (0.0 + 3.0 + 3.0 - mid_vy) * CELL;   // E: row_offset=0
+    let d_vert_y = (50.0 + 3.0 + 3.0 - mid_vy) * CELL;  // D: row_offset=50
+    let e_vert_x = (0.0 + 3.0 - mid_hx) * CELL;
+    let d_vert_x = (40.0 + 3.0 - mid_hx) * CELL;
 
     GeoData {
         verts_v,
         verts_h,
         letter_ranges,
         n_verts,
-        mid_vy: mid_vy_val,
-        mid_hx: mid_hx_val,
         e_vert_y,
         d_vert_y,
         e_vert_x,
@@ -342,7 +338,6 @@ static GEO: LazyLock<GeoData> = LazyLock::new(build_geo_data);
 // Helpers
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub fn should_skip(z: f64) -> bool {
     z > FADE_CUTOFF
 }
@@ -364,7 +359,8 @@ fn glitch_rand(seed: i64) -> f64 {
 // get_stamp_cells  (public so allocate can use it too)
 // ---------------------------------------------------------------------------
 
-pub fn get_stamp_cells(px: f64, py: f64) -> Vec<StampCellPos> {
+/// Returns the stamp cells and whether any cells were clipped by the viewport.
+pub fn get_stamp_cells_with_clip(px: f64, py: f64) -> (Vec<StampCellPos>, bool) {
     let pxi = px as i32; // JS `px|0` — truncate toward zero
     let pyi = py as i32;
     let xs = ((pxi % 8) + 8) % 8;
@@ -373,27 +369,29 @@ pub fn get_stamp_cells(px: f64, py: f64) -> Vec<StampCellPos> {
     let all_stamps = &*STAMPS_TABLE;
     let stamp = &all_stamps[stamp_idx];
 
-    // JS:  const br=Math.floor(py/8)-1, bc=Math.floor(px/8)-1;
-    // br is row (from py), bc is col (from px).
     let br_actual = (py / 8.0).floor() as i32 - 1;
     let bc_actual = (px / 8.0).floor() as i32 - 1;
 
-    stamp
-        .iter()
-        .filter_map(|s| {
-            let row = br_actual + s.dr as i32;
-            let col = bc_actual + s.dc as i32;
-            if row >= 0 && row < ROWS as i32 && col >= 0 && col < COLS as i32 {
-                Some(StampCellPos {
-                    row,
-                    col,
-                    ch: s.ch,
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
+    let mut cells = Vec::new();
+    let mut clipped = false;
+    for s in stamp {
+        let row = br_actual + s.dr as i32;
+        let col = bc_actual + s.dc as i32;
+        if row >= 0 && row < ROWS as i32 && col >= 0 && col < COLS as i32 {
+            cells.push(StampCellPos {
+                row,
+                col,
+                ch: s.ch,
+            });
+        } else {
+            clipped = true;
+        }
+    }
+    (cells, clipped)
+}
+
+pub fn get_stamp_cells(px: f64, py: f64) -> Vec<StampCellPos> {
+    get_stamp_cells_with_clip(px, py).0
 }
 
 // ---------------------------------------------------------------------------
@@ -493,23 +491,6 @@ pub fn gen_positions(f: usize) -> FramePositions {
     } else {
         0.0
     };
-
-    // Glitch
-    let mut _glitch_zoom: f64 = 1.0;
-    let mut _glitch_off_x: f64 = 0.0;
-    let mut _glitch_off_y: f64 = 0.0;
-    let glitch_seed = (ff / 50.0).floor() as i64;
-    let glitch_chance = glitch_rand(glitch_seed * 7 + 3);
-    if glitch_chance > 0.55 {
-        let glitch_start = (glitch_rand(glitch_seed * 13 + 1) * 46.0).floor() as usize;
-        let glitch_len = 2 + (glitch_rand(glitch_seed * 19 + 5) * 3.0).floor() as usize;
-        let local_f = f % 50;
-        if local_f >= glitch_start && local_f < glitch_start + glitch_len {
-            _glitch_zoom = 1.6 + glitch_rand(glitch_seed * 31 + 7) * 0.8;
-            _glitch_off_x = (glitch_rand(glitch_seed * 37 + 11) - 0.5) * 80.0;
-            _glitch_off_y = (glitch_rand(glitch_seed * 41 + 13) - 0.5) * 50.0;
-        }
-    }
 
     let pulse = 1.0 + 0.12 * pulse_amt;
     let cur_r = GEO_R * zoom_factor * pulse;
@@ -626,7 +607,7 @@ pub fn gen_positions(f: usize) -> FramePositions {
             .min(1.0)
     };
 
-    // E-letter scale
+    // E-letter scale (sized for the larger 21px circle)
     let e_scale: f64 = if f < P1_END {
         2.0
     } else if f < P2_END {
@@ -637,7 +618,7 @@ pub fn gen_positions(f: usize) -> FramePositions {
         1.0
     };
 
-    let mut result: Vec<DiscPosition> = Vec::new();
+    let mut result: Vec<DiscPosition> = Vec::with_capacity(geo.n_verts * 3);
 
     if f < P4_END {
         for i in 0..geo.n_verts {
@@ -798,7 +779,7 @@ pub fn gen_positions(f: usize) -> FramePositions {
     let glitch_color_active = glitch_rand(ff as i64 * 17 + 7) > 0.92;
 
     // Sort by z (front-to-back)
-    result.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| a.z.total_cmp(&b.z));
 
     FramePositions {
         positions: result,
@@ -837,6 +818,63 @@ fn try_mux_fit(sprite_list: &[(f64, f64)]) -> bool {
     true
 }
 
+/// Build a cell-level sprite coverage map: for each char cell, count how many
+/// sprite pixels from foreground sprites (z <= 0) cover it.
+fn build_sprite_coverage(
+    vis: &[DiscPosition],
+    mode: &[DiscMode],
+    spr_pixels: &[u8],
+) -> Vec<u16> {
+    let mut coverage = vec![0u16; ROWS * COLS];
+    for (i, p) in vis.iter().enumerate() {
+        if mode[i] != DiscMode::Sprite || p.z > 0.0 {
+            continue;
+        }
+        add_sprite_to_coverage(&mut coverage, p, spr_pixels);
+    }
+    coverage
+}
+
+/// Incrementally add one foreground sprite's pixel footprint to the coverage map.
+fn add_sprite_to_coverage(
+    coverage: &mut [u16],
+    p: &DiscPosition,
+    spr_pixels: &[u8],
+) {
+    if p.z > 0.0 {
+        return;
+    }
+    let ox = p.x.floor() as i32 - 8;
+    let oy = p.y.floor() as i32 - 8;
+    for sr in 0..SPRITE_H {
+        let sy = oy + sr as i32;
+        if sy < 0 || sy >= C64H as i32 {
+            continue;
+        }
+        for sc in 0..SPRITE_W {
+            if spr_pixels[sr * SPRITE_W + sc] == 0 {
+                continue;
+            }
+            let sx = ox + sc as i32;
+            if sx < 0 || sx >= C64W as i32 {
+                continue;
+            }
+            let cell_r = sy as usize / CHH;
+            let cell_c = sx as usize / CHW;
+            if cell_r < ROWS && cell_c < COLS {
+                coverage[cell_r * COLS + cell_c] += 1;
+            }
+        }
+    }
+}
+
+/// Check if a cell is masked by sprite coverage.
+#[inline]
+fn is_cell_masked(coverage: &[u16], row: i32, col: i32) -> bool {
+    let idx = row as usize * COLS + col as usize;
+    coverage[idx] >= MASK_THRESHOLD
+}
+
 pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     if positions.is_empty() {
         return AllocResult {
@@ -858,12 +896,13 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
 
     for (i, p) in positions.iter().enumerate() {
         if p.x >= -12.0 && p.x < C64W as f64 + 12.0 && p.y >= -12.0 && p.y < C64H as f64 + 12.0 {
-            let cells = get_stamp_cells(p.x, p.y);
-            let near_edge = p.y < 12.0 || p.y > C64H as f64 - 12.0 || p.x < 12.0 || p.x > C64W as f64 - 12.0;
+            let (cells, clipped) = get_stamp_cells_with_clip(p.x, p.y);
+            let near_edge = p.y < 16.0 || p.y > C64H as f64 - 16.0 || p.x < 16.0 || p.x > C64W as f64 - 16.0;
             if !cells.is_empty() {
                 vis.push(p.clone());
                 vis_idx.push(i);
-                force_sprite.push(near_edge && cells.len() <= 2);
+                // Force sprite if stamp was clipped by viewport or disc is near edge with no stamp
+                force_sprite.push(clipped);
                 stamp_data.push(cells);
             } else if near_edge {
                 vis.push(p.clone());
@@ -878,7 +917,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     let mut mode: Vec<DiscMode> = vec![DiscMode::Char; vis_len];
     let mut sprite_vis: Vec<usize> = Vec::new();
 
-    // Force-sprite pass
+    // Force-sprite pass — clipped stamps must be sprite or offscreen, never char
     for i in 0..vis_len {
         if force_sprite[i] {
             let mut test_list: Vec<(f64, f64)> =
@@ -887,12 +926,15 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
             if try_mux_fit(&test_list) {
                 mode[i] = DiscMode::Sprite;
                 sprite_vis.push(i);
+            } else {
+                // Can't fit in mux — don't render a clipped char stamp
+                mode[i] = DiscMode::Offscreen;
             }
         }
     }
 
-    // Build conflicts helper
-    let build_conflicts = |mode: &[DiscMode], stamp_data: &[Vec<StampCellPos>]| -> Vec<u16> {
+    // Build conflicts helper — only counts conflicts in cells NOT masked by sprites
+    let build_conflicts = |mode: &[DiscMode], stamp_data: &[Vec<StampCellPos>], coverage: &[u16]| -> Vec<u16> {
         let mut cell_owners: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for i in 0..vis_len {
             if mode[i] != DiscMode::Char {
@@ -903,8 +945,8 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
             }
         }
         let mut cc = vec![0u16; vis_len];
-        for owners in cell_owners.values() {
-            if owners.len() > 1 {
+        for (&(row, col), owners) in &cell_owners {
+            if owners.len() > 1 && !is_cell_masked(coverage, row, col) {
                 for &o in owners {
                     cc[o] += (owners.len() - 1) as u16;
                 }
@@ -913,9 +955,13 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
         cc
     };
 
+    // Build initial sprite coverage from force-sprite assignments
+    let spr_pixels = &*SPR_PIXELS;
+    let mut coverage = build_sprite_coverage(&vis, &mode, spr_pixels);
+
     // Iterative promotion to sprite
     for _iter in 0..vis_len {
-        let cc = build_conflicts(&mode, &stamp_data);
+        let cc = build_conflicts(&mode, &stamp_data, &coverage);
         let mut cands: Vec<(usize, u16)> = Vec::new();
         for i in 0..vis_len {
             if mode[i] == DiscMode::Char && cc[i] > 0 {
@@ -935,6 +981,8 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
             if try_mux_fit(&test_list) {
                 mode[cand_i] = DiscMode::Sprite;
                 sprite_vis.push(cand_i);
+                // Incrementally update coverage if this is a foreground sprite
+                add_sprite_to_coverage(&mut coverage, &vis[cand_i], spr_pixels);
                 promoted = true;
                 break;
             }
@@ -944,7 +992,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
         }
     }
 
-    // Nudge pass
+    // Nudge pass — coverage is stable here (no new sprite promotions)
     {
         let offsets: [(i32, i32); 12] = [
             (-1, 0),
@@ -975,10 +1023,10 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                 }
             }
 
-            // Find all discs involved in conflicts
+            // Find all discs involved in unmasked conflicts
             let mut cds: Vec<usize> = Vec::new();
-            for owners in co.values() {
-                if owners.len() > 1 {
+            for (&(row, col), owners) in &co {
+                if owners.len() > 1 && !is_cell_masked(&coverage, row, col) {
                     for &x in owners {
                         cds.push(x);
                     }
@@ -991,9 +1039,12 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                 if mode[di] != DiscMode::Char {
                     continue;
                 }
-                // Count current conflicts for this disc
+                // Count current unmasked conflicts for this disc
                 let mut cur = 0i32;
                 for s in &stamp_data[di] {
+                    if is_cell_masked(&coverage, s.row, s.col) {
+                        continue;
+                    }
                     if let Some(o) = co.get(&(s.row, s.col)) {
                         if o.len() > 1 {
                             cur += 1;
@@ -1017,6 +1068,9 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                     }
                     let mut nc = 0i32;
                     for s in &ns {
+                        if is_cell_masked(&coverage, s.row, s.col) {
+                            continue;
+                        }
                         if let Some(o) = co.get(&(s.row, s.col)) {
                             let oc = o.iter().filter(|&&x| x != di).count();
                             if oc > 0 {
@@ -1077,13 +1131,39 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
 
     for vi in 0..vis_len {
         let gi = vis_idx[vi];
-        asgn[gi].mode = mode[vi].clone();
+        asgn[gi].mode = mode[vi];
         asgn[gi].stamp = stamp_data[vi].clone();
         asgn[gi].x = vis[vi].x;
         asgn[gi].y = vis[vi].y;
     }
 
-    // Count char conflicts
+    // Rebuild final coverage from all sprite assignments for accurate conflict count
+    let final_coverage = {
+        let mut fc = vec![0u16; ROWS * COLS];
+        for a in &asgn {
+            if a.mode == DiscMode::Sprite && a.z <= 0.0 {
+                let ox = a.x.floor() as i32 - 8;
+                let oy = a.y.floor() as i32 - 8;
+                for sr in 0..SPRITE_H {
+                    let sy = oy + sr as i32;
+                    if sy < 0 || sy >= C64H as i32 { continue; }
+                    for sc in 0..SPRITE_W {
+                        if spr_pixels[sr * SPRITE_W + sc] == 0 { continue; }
+                        let sx = ox + sc as i32;
+                        if sx < 0 || sx >= C64W as i32 { continue; }
+                        let cell_r = sy as usize / CHH;
+                        let cell_c = sx as usize / CHW;
+                        if cell_r < ROWS && cell_c < COLS {
+                            fc[cell_r * COLS + cell_c] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        fc
+    };
+
+    // Count visible char conflicts (not masked by foreground sprites)
     let mut char_conflicts: u32 = 0;
     {
         let mut cm: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -1095,8 +1175,8 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                 cm.entry((s.row, s.col)).or_default().push(i);
             }
         }
-        for owners in cm.values() {
-            if owners.len() > 1 {
+        for (&(row, col), owners) in &cm {
+            if owners.len() > 1 && !is_cell_masked(&final_coverage, row, col) {
                 char_conflicts += 1;
             }
         }
@@ -1125,26 +1205,31 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     let mut mux_used: u8 = 0;
     let mut sprite_slot_lookup: HashMap<usize, u8> = HashMap::new();
 
+    let mut mux_overflows: u32 = 0;
     for si in &sprite_infos {
+        let mut assigned = false;
         for s in 0..8u8 {
             if slot_free_at[s as usize] <= si.top_y {
                 slot_free_at[s as usize] = si.top_y + MUX_H as i32;
                 sprite_slot_lookup.insert(si.idx, s);
                 mux_used = mux_used.max(s + 1);
+                assigned = true;
                 break;
             }
+        }
+        if !assigned {
+            mux_overflows += 1;
         }
     }
 
     // Build sl_counts
-    let c64h = C64H;
-    let mut sl_counts = vec![0u8; c64h];
+    let mut sl_counts = vec![0u8; C64H];
     for si in &sprite_infos {
         if sprite_slot_lookup.get(&si.idx).is_none() {
             continue;
         }
         let top = si.top_y.max(0) as usize;
-        let bot = (si.top_y + SPRITE_H as i32 - 1).min(c64h as i32 - 1) as usize;
+        let bot = (si.top_y + SPRITE_H as i32 - 1).min(C64H as i32 - 1) as usize;
         for sl in top..=bot {
             sl_counts[sl] += 1;
         }
@@ -1162,7 +1247,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
         asgn,
         sl_counts,
         max_sl,
-        mux_overflows: 0,
+        mux_overflows,
         mux_used,
         conflicts: char_conflicts,
         sprite_slot_map,

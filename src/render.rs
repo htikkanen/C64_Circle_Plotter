@@ -37,6 +37,9 @@ pub struct DisplayOpts {
     pub corruption: bool,
     pub c64only: bool,
     pub mux: bool,
+    pub show_chars: bool,
+    pub show_sprites: bool,
+    pub prune_dist: f64,
 }
 
 impl Default for DisplayOpts {
@@ -48,6 +51,9 @@ impl Default for DisplayOpts {
             corruption: true,
             c64only: true,
             mux: false,
+            show_chars: true,
+            show_sprites: true,
+            prune_dist: 0.0,
         }
     }
 }
@@ -131,23 +137,45 @@ pub fn disc_color(a: &Assignment, glitch_color_active: bool, glitch_frame: usize
 ///   - `Vec<u8>`: scanline counts for scanline visualisation (length C64H)
 pub fn render_frame(
     frame_positions: &FramePositions,
-    spr_pixels: &[u8],
-    char_pixels: &[[u8; 64]; 256],
     opts: &DisplayOpts,
 ) -> (Vec<u8>, FrameStats, Vec<u8>) {
+    let spr_pixels = &*SPR_PIXELS;
+    let char_pixels = &*CHAR_PIXELS;
     let positions = &frame_positions.positions;
     // 1. Filter by should_skip
-    let vis_positions: Vec<DiscPosition> = positions
+    let mut vis_positions: Vec<DiscPosition> = positions
         .iter()
         .filter(|p| !should_skip(p.z))
         .cloned()
         .collect();
 
+    // 1b. Proximity pruning — remove discs too close to a more important disc
+    if opts.prune_dist > 0.0 {
+        let threshold_sq = opts.prune_dist * opts.prune_dist;
+        // Sort: non-ghosts before ghosts, then by z ascending (front first)
+        vis_positions.sort_by(|a, b| {
+            a.is_ghost.cmp(&b.is_ghost).then(a.z.total_cmp(&b.z))
+        });
+        let mut kept: Vec<DiscPosition> = Vec::with_capacity(vis_positions.len());
+        for p in &vis_positions {
+            let dominated = kept.iter().any(|k| {
+                let dx = p.x - k.x;
+                let dy = p.y - k.y;
+                dx * dx + dy * dy < threshold_sq
+            });
+            if !dominated {
+                kept.push(p.clone());
+            }
+        }
+        // Restore original z-sort order (front-to-back)
+        kept.sort_by(|a, b| a.z.total_cmp(&b.z));
+        vis_positions = kept;
+    }
+
     // 2. Allocate visible positions
-    let alloc_result = allocate(&vis_positions);
-    let asgn = &alloc_result.asgn;
-    let sl_counts = &alloc_result.sl_counts;
-    let sprite_slot_map = &alloc_result.sprite_slot_map;
+    let AllocResult {
+        asgn, sl_counts, sprite_slot_map, max_sl, mux_overflows, mux_used, conflicts,
+    } = allocate(&vis_positions);
 
     // 3. Initialise RGBA buffer to black with full alpha
     let buf_len = C64W * C64H * 4;
@@ -159,7 +187,7 @@ pub fn render_frame(
 
     // 4. Build screen RAM, owner map, overlap flags, and color RAM
     let cell_count = ROWS * COLS;
-    let mut screen_ram = vec![EMPTY_IDX; cell_count];
+    let mut screen_ram = vec![EMPTY_IDX as u16; cell_count];
     let mut screen_owner = vec![-1i32; cell_count];
     let mut screen_over = vec![0u8; cell_count];
     let mut color_ram: Vec<Option<[u8; 3]>> = vec![None; cell_count];
@@ -213,72 +241,69 @@ pub fn render_frame(
         }
     }
 
-    // 6. Render sprites
-    for (ai, a) in asgn.iter().enumerate() {
-        if a.mode != DiscMode::Sprite {
-            continue;
-        }
-        let slot = sprite_slot_map.get(ai).and_then(|s| *s);
-        let has_slot = slot.is_some();
-        let col: Option<[u8; 3]> = if opts.c64only || !opts.color {
-            if has_slot {
-                Some(disc_color(a, glitch_color_active, glitch_frame))
-            } else {
-                None
+    // 6. Render background sprites (z > 0) — behind chars
+    if opts.show_sprites {
+        for (ai, a) in asgn.iter().enumerate() {
+            if a.mode != DiscMode::Sprite || a.z <= 0.0 {
+                continue;
             }
-        } else if has_slot {
-            Some(COL_SPR)
-        } else {
-            Some([100, 30, 30])
-        };
-        let bg_priority = a.z > 0.0;
-        if let Some(col) = col {
-            render_sprite(a, &col, bg_priority, spr_pixels, &char_mask, &mut d);
+            let slot = sprite_slot_map.get(ai).and_then(|s| *s);
+            let has_slot = slot.is_some();
+            let col: Option<[u8; 3]> = if opts.c64only || !opts.color {
+                if has_slot {
+                    Some(disc_color(a, glitch_color_active, glitch_frame))
+                } else {
+                    None
+                }
+            } else if has_slot {
+                Some(COL_SPR)
+            } else {
+                Some([100, 30, 30])
+            };
+            if let Some(col) = col {
+                render_sprite(a, &col, true, &char_mask, &mut d);
+            }
         }
     }
 
-    // 7. Render chars (pass 2) — paints over the pixel buffer
-    for r in 0..ROWS {
-        for c in 0..COLS {
-            let ch_idx = screen_ram[r * COLS + c];
-            let cpx = &char_pixels[ch_idx as usize];
-            let bx = c * CHW;
-            let by = r * CHH;
-            let was_over = screen_over[r * COLS + c] > 0;
+    // 7. Render chars — paints over background sprites
+    if opts.show_chars {
+        for r in 0..ROWS {
+            for c in 0..COLS {
+                let ch_idx = screen_ram[r * COLS + c];
+                let cpx = &char_pixels[ch_idx as usize];
+                let bx = c * CHW;
+                let by = r * CHH;
+                let was_over = screen_over[r * COLS + c] > 0;
 
-            let cell_color = color_ram[r * COLS + c];
+                let cell_color = color_ram[r * COLS + c];
 
-            let (fg, bg): ([u8; 3], [u8; 3]) = if opts.c64only {
-                (cell_color.unwrap_or(COL_WHITE), COL_BG)
-            } else if opts.color && was_over && opts.corruption {
-                ([255, 212, 59], [60, 40, 0])
-            } else if opts.color {
-                (COL_CHAR, COL_BG)
-            } else {
-                (COL_WHITE, COL_BG)
-            };
+                let (fg, bg): ([u8; 3], [u8; 3]) = if opts.c64only {
+                    (cell_color.unwrap_or(COL_WHITE), COL_BG)
+                } else if opts.color && was_over && opts.corruption {
+                    ([255, 212, 59], [60, 40, 0])
+                } else if opts.color {
+                    (COL_CHAR, COL_BG)
+                } else {
+                    (COL_WHITE, COL_BG)
+                };
 
-            let show_empty = opts.grid && !opts.c64only;
-            let empty_bg: [u8; 3] = [40, 20, 60];
+                let show_empty = opts.grid && !opts.c64only;
+                let empty_bg: [u8; 3] = [40, 20, 60];
 
-            for py in 0..8usize {
-                for px in 0..8usize {
-                    let sx = bx + px;
-                    let sy = by + py;
-                    if sx < C64W && sy < C64H {
-                        let idx = (sy * C64W + sx) * 4;
-                        if cpx[py * 8 + px] != 0 {
-                            d[idx] = fg[0];
-                            d[idx + 1] = fg[1];
-                            d[idx + 2] = fg[2];
-                        } else if was_over && opts.corruption && !opts.c64only {
-                            d[idx] = bg[0];
-                            d[idx + 1] = bg[1];
-                            d[idx + 2] = bg[2];
-                        } else if show_empty && ch_idx != EMPTY_IDX {
-                            d[idx] = empty_bg[0];
-                            d[idx + 1] = empty_bg[1];
-                            d[idx + 2] = empty_bg[2];
+                for py in 0..8usize {
+                    for px in 0..8usize {
+                        let sx = bx + px;
+                        let sy = by + py;
+                        if sx < C64W && sy < C64H {
+                            let idx = (sy * C64W + sx) * 4;
+                            if cpx[py * 8 + px] != 0 {
+                                set_rgb(&mut d, idx, fg);
+                            } else if was_over && opts.corruption && !opts.c64only {
+                                set_rgb(&mut d, idx, bg);
+                            } else if show_empty && ch_idx != EMPTY_IDX {
+                                set_rgb(&mut d, idx, empty_bg);
+                            }
                         }
                     }
                 }
@@ -286,17 +311,42 @@ pub fn render_frame(
         }
     }
 
-    // 8. Compute memory stats (pixel-level occlusion)
-    let mut mem_positions: Vec<&DiscPosition> = positions
+    // 8. Render foreground sprites (z <= 0) — on top of chars
+    if opts.show_sprites {
+        for (ai, a) in asgn.iter().enumerate() {
+            if a.mode != DiscMode::Sprite || a.z > 0.0 {
+                continue;
+            }
+            let slot = sprite_slot_map.get(ai).and_then(|s| *s);
+            let has_slot = slot.is_some();
+            let col: Option<[u8; 3]> = if opts.c64only || !opts.color {
+                if has_slot {
+                    Some(disc_color(a, glitch_color_active, glitch_frame))
+                } else {
+                    None
+                }
+            } else if has_slot {
+                Some(COL_SPR)
+            } else {
+                Some([100, 30, 30])
+            };
+            if let Some(col) = col {
+                render_sprite(a, &col, false, &char_mask, &mut d);
+            }
+        }
+    }
+
+    // 9. Compute memory stats (pixel-level occlusion) — uses pruned positions
+    let mut mem_positions: Vec<&DiscPosition> = vis_positions
         .iter()
         .filter(|p| {
             let ox = p.x.round() as i32 - 8;
             let oy = p.y.round() as i32 - 8;
-            ox + 16 > 0 && ox < C64W as i32 && oy + 15 > 0 && oy < C64H as i32
+            ox + SPRITE_W as i32 > 0 && ox < C64W as i32 && oy + SPRITE_H as i32 > 0 && oy < C64H as i32
         })
         .collect();
     // Sort front-to-back (highest z first)
-    mem_positions.sort_by(|a, b| b.z.partial_cmp(&a.z).unwrap_or(std::cmp::Ordering::Equal));
+    mem_positions.sort_by(|a, b| b.z.total_cmp(&a.z));
 
     let mut screen_claimed = vec![0u8; C64W * C64H];
     let mut mem_discs: usize = 0;
@@ -333,29 +383,42 @@ pub fn render_frame(
 
     let mem_bytes = mem_discs * 3;
 
-    // 9. Compute stats
-    let sprite_count = asgn.iter().filter(|a| a.mode == DiscMode::Sprite).count();
-    let char_count = asgn.iter().filter(|a| a.mode == DiscMode::Char).count();
-    let visible_count = asgn
-        .iter()
-        .filter(|a| a.mode != DiscMode::Offscreen)
-        .count();
+    // 10. Compute stats (single pass)
+    let (mut sprites, mut chars) = (0usize, 0usize);
+    for a in &asgn {
+        match a.mode {
+            DiscMode::Sprite => sprites += 1,
+            DiscMode::Char => chars += 1,
+            DiscMode::Offscreen => {}
+        }
+    }
 
     let stats = FrameStats {
         total: asgn.len(),
-        visible: visible_count,
-        sprites: sprite_count,
-        chars: char_count,
-        conflicts: alloc_result.conflicts,
-        max_sl: alloc_result.max_sl,
-        mux_overflows: alloc_result.mux_overflows,
-        mux_used: alloc_result.mux_used,
+        visible: sprites + chars,
+        sprites,
+        chars,
+        conflicts,
+        max_sl,
+        mux_overflows,
+        mux_used,
         mem_discs,
         on_screen_count,
         mem_bytes,
     };
 
-    (d, stats, sl_counts.to_vec())
+    (d, stats, sl_counts)
+}
+
+// ============================================================
+// Pixel helpers
+// ============================================================
+
+#[inline]
+fn set_rgb(d: &mut [u8], idx: usize, col: [u8; 3]) {
+    d[idx] = col[0];
+    d[idx + 1] = col[1];
+    d[idx + 2] = col[2];
 }
 
 // ============================================================
@@ -366,10 +429,10 @@ fn render_sprite(
     a: &Assignment,
     col: &[u8; 3],
     bg_priority: bool,
-    spr_pixels: &[u8],
     char_mask: &[u8],
     d: &mut [u8],
 ) {
+    let spr_pixels = &*SPR_PIXELS;
     let ox = a.x.floor() as i32 - 8;
     let oy = a.y.floor() as i32 - 8;
     for sr in 0..SPRITE_H {
@@ -390,9 +453,7 @@ fn render_sprite(
                 continue;
             }
             let idx = (sy as usize * C64W + sx as usize) * 4;
-            d[idx] = col[0];
-            d[idx + 1] = col[1];
-            d[idx + 2] = col[2];
+            set_rgb(d, idx, *col);
         }
     }
 }
