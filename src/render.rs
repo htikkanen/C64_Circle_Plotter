@@ -241,26 +241,23 @@ pub fn render_frame(
         }
     }
 
+    // Helper: determine sprite display color
+    let sprite_col = |a: &Assignment, ai: usize| -> Option<[u8; 3]> {
+        let has_slot = sprite_slot_map.get(ai).and_then(|s| *s).is_some();
+        if opts.c64only || !opts.color {
+            if has_slot { Some(disc_color(a, glitch_color_active, glitch_frame)) } else { None }
+        } else if has_slot {
+            Some(COL_SPR)
+        } else {
+            Some([100, 30, 30])
+        }
+    };
+
     // 6. Render background sprites (z > 0) — behind chars
     if opts.show_sprites {
         for (ai, a) in asgn.iter().enumerate() {
-            if a.mode != DiscMode::Sprite || a.z <= 0.0 {
-                continue;
-            }
-            let slot = sprite_slot_map.get(ai).and_then(|s| *s);
-            let has_slot = slot.is_some();
-            let col: Option<[u8; 3]> = if opts.c64only || !opts.color {
-                if has_slot {
-                    Some(disc_color(a, glitch_color_active, glitch_frame))
-                } else {
-                    None
-                }
-            } else if has_slot {
-                Some(COL_SPR)
-            } else {
-                Some([100, 30, 30])
-            };
-            if let Some(col) = col {
+            if a.mode != DiscMode::Sprite || a.z <= 0.0 { continue; }
+            if let Some(col) = sprite_col(a, ai) {
                 render_sprite(a, &col, true, &char_mask, &mut d);
             }
         }
@@ -314,23 +311,8 @@ pub fn render_frame(
     // 8. Render foreground sprites (z <= 0) — on top of chars
     if opts.show_sprites {
         for (ai, a) in asgn.iter().enumerate() {
-            if a.mode != DiscMode::Sprite || a.z > 0.0 {
-                continue;
-            }
-            let slot = sprite_slot_map.get(ai).and_then(|s| *s);
-            let has_slot = slot.is_some();
-            let col: Option<[u8; 3]> = if opts.c64only || !opts.color {
-                if has_slot {
-                    Some(disc_color(a, glitch_color_active, glitch_frame))
-                } else {
-                    None
-                }
-            } else if has_slot {
-                Some(COL_SPR)
-            } else {
-                Some([100, 30, 30])
-            };
-            if let Some(col) = col {
+            if a.mode != DiscMode::Sprite || a.z > 0.0 { continue; }
+            if let Some(col) = sprite_col(a, ai) {
                 render_sprite(a, &col, false, &char_mask, &mut d);
             }
         }

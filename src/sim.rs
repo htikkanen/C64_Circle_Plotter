@@ -935,8 +935,9 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
 
     // Build conflicts helper — only counts conflicts in cells NOT masked by sprites
     let build_conflicts = |mode: &[DiscMode], stamp_data: &[Vec<StampCellPos>], coverage: &[u16]| -> Vec<u16> {
+        let n = mode.len();
         let mut cell_owners: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-        for i in 0..vis_len {
+        for i in 0..n {
             if mode[i] != DiscMode::Char {
                 continue;
             }
@@ -944,7 +945,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                 cell_owners.entry((s.row, s.col)).or_default().push(i);
             }
         }
-        let mut cc = vec![0u16; vis_len];
+        let mut cc = vec![0u16; n];
         for (&(row, col), owners) in &cell_owners {
             if owners.len() > 1 && !is_cell_masked(coverage, row, col) {
                 for &o in owners {
@@ -1137,31 +1138,9 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
         asgn[gi].y = vis[vi].y;
     }
 
-    // Rebuild final coverage from all sprite assignments for accurate conflict count
-    let final_coverage = {
-        let mut fc = vec![0u16; ROWS * COLS];
-        for a in &asgn {
-            if a.mode == DiscMode::Sprite && a.z <= 0.0 {
-                let ox = a.x.floor() as i32 - 8;
-                let oy = a.y.floor() as i32 - 8;
-                for sr in 0..SPRITE_H {
-                    let sy = oy + sr as i32;
-                    if sy < 0 || sy >= C64H as i32 { continue; }
-                    for sc in 0..SPRITE_W {
-                        if spr_pixels[sr * SPRITE_W + sc] == 0 { continue; }
-                        let sx = ox + sc as i32;
-                        if sx < 0 || sx >= C64W as i32 { continue; }
-                        let cell_r = sy as usize / CHH;
-                        let cell_c = sx as usize / CHW;
-                        if cell_r < ROWS && cell_c < COLS {
-                            fc[cell_r * COLS + cell_c] += 1;
-                        }
-                    }
-                }
-            }
-        }
-        fc
-    };
+    // Reuse the coverage map from the promotion loop — it already includes
+    // all foreground sprites (force-sprite + iteratively promoted).
+    // The nudge pass doesn't change sprite assignments, so coverage is still valid.
 
     // Count visible char conflicts (not masked by foreground sprites)
     let mut char_conflicts: u32 = 0;
@@ -1176,7 +1155,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
             }
         }
         for (&(row, col), owners) in &cm {
-            if owners.len() > 1 && !is_cell_masked(&final_coverage, row, col) {
+            if owners.len() > 1 && !is_cell_masked(&coverage, row, col) {
                 char_conflicts += 1;
             }
         }
