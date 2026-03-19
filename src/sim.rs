@@ -778,8 +778,13 @@ pub fn gen_positions(f: usize) -> FramePositions {
 
     let glitch_color_active = glitch_rand(ff as i64 * 17 + 7) > 0.92;
 
-    // Sort by z (front-to-back)
-    result.sort_by(|a, b| a.z.total_cmp(&b.z));
+    // Sort by z (front-to-back). Push ghosts deep so main discs get
+    // priority for sprite slots and char cells. Deeper ghosts sort further back.
+    result.sort_by(|a, b| {
+        let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
+        let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
+        za.total_cmp(&zb)
+    });
 
     FramePositions {
         positions: result,
@@ -933,7 +938,7 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
         }
     }
 
-    // Build conflicts helper — only counts conflicts in cells NOT masked by sprites
+    // Build conflicts helper — all char discs, unmasked cells
     let build_conflicts = |mode: &[DiscMode], stamp_data: &[Vec<StampCellPos>], coverage: &[u16]| -> Vec<u16> {
         let n = mode.len();
         let mut cell_owners: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -960,36 +965,37 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     let spr_pixels = &*SPR_PIXELS;
     let mut coverage = build_sprite_coverage(&vis, &mode, spr_pixels);
 
-    // Iterative promotion to sprite
-    for _iter in 0..vis_len {
-        let cc = build_conflicts(&mode, &stamp_data, &coverage);
-        let mut cands: Vec<(usize, u16)> = Vec::new();
-        for i in 0..vis_len {
-            if mode[i] == DiscMode::Char && cc[i] > 0 {
-                cands.push((i, cc[i]));
+    // Iterative promotion to sprite — main discs first, then ghosts with remaining slots
+    for pass_ghost in [false, true] {
+        for _iter in 0..vis_len {
+            let cc = build_conflicts(&mode, &stamp_data, &coverage);
+            let mut cands: Vec<(usize, u16)> = Vec::new();
+            for i in 0..vis_len {
+                if mode[i] == DiscMode::Char && vis[i].is_ghost == pass_ghost && cc[i] > 0 {
+                    cands.push((i, cc[i]));
+                }
             }
-        }
-        if cands.is_empty() {
-            break;
-        }
-        cands.sort_by(|a, b| b.1.cmp(&a.1));
-
-        let mut promoted = false;
-        for &(cand_i, _) in &cands {
-            let mut test_list: Vec<(f64, f64)> =
-                sprite_vis.iter().map(|&vi| (vis[vi].x, vis[vi].y)).collect();
-            test_list.push((vis[cand_i].x, vis[cand_i].y));
-            if try_mux_fit(&test_list) {
-                mode[cand_i] = DiscMode::Sprite;
-                sprite_vis.push(cand_i);
-                // Incrementally update coverage if this is a foreground sprite
-                add_sprite_to_coverage(&mut coverage, &vis[cand_i], spr_pixels);
-                promoted = true;
+            if cands.is_empty() {
                 break;
             }
-        }
-        if !promoted {
-            break;
+            cands.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let mut promoted = false;
+            for &(cand_i, _) in &cands {
+                let mut test_list: Vec<(f64, f64)> =
+                    sprite_vis.iter().map(|&vi| (vis[vi].x, vis[vi].y)).collect();
+                test_list.push((vis[cand_i].x, vis[cand_i].y));
+                if try_mux_fit(&test_list) {
+                    mode[cand_i] = DiscMode::Sprite;
+                    sprite_vis.push(cand_i);
+                    add_sprite_to_coverage(&mut coverage, &vis[cand_i], spr_pixels);
+                    promoted = true;
+                    break;
+                }
+            }
+            if !promoted {
+                break;
+            }
         }
     }
 
@@ -1013,10 +1019,10 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
         for _nr in 0..3 {
             let mut improved = false;
 
-            // Build cell owner map for char-mode discs
+            // Build cell owner map for non-ghost char-mode discs
             let mut co: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
             for i in 0..vis_len {
-                if mode[i] != DiscMode::Char {
+                if mode[i] != DiscMode::Char || vis[i].is_ghost {
                     continue;
                 }
                 for s in &stamp_data[i] {
@@ -1145,9 +1151,10 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
     // Count visible char conflicts (not masked by foreground sprites)
     let mut char_conflicts: u32 = 0;
     {
+        // Only count conflicts between non-ghost chars (ghosts yield to main discs)
         let mut cm: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for (i, a) in asgn.iter().enumerate() {
-            if a.mode != DiscMode::Char {
+            if a.mode != DiscMode::Char || a.is_ghost {
                 continue;
             }
             for s in &a.stamp {

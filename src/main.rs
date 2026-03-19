@@ -395,6 +395,10 @@ impl C64App {
                 option_toggle(&mut cols[0], "Chars", &mut self.opts.show_chars);
                 option_toggle(&mut cols[1], "Sprites", &mut self.opts.show_sprites);
             });
+            ui.columns(2, |cols| {
+                option_toggle(&mut cols[0], "Error overlay", &mut self.opts.error_overlay);
+                option_toggle(&mut cols[1], "Ideal render", &mut self.opts.ideal_render);
+            });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.colored_label(COL_DIM, egui::RichText::new("Prune dist").size(10.0));

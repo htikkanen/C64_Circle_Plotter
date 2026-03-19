@@ -40,6 +40,8 @@ pub struct DisplayOpts {
     pub show_chars: bool,
     pub show_sprites: bool,
     pub prune_dist: f64,
+    pub error_overlay: bool,
+    pub ideal_render: bool,
 }
 
 impl Default for DisplayOpts {
@@ -53,7 +55,9 @@ impl Default for DisplayOpts {
             mux: false,
             show_chars: true,
             show_sprites: true,
-            prune_dist: 0.0,
+            prune_dist: 2.0,
+            error_overlay: false,
+            ideal_render: false,
         }
     }
 }
@@ -152,9 +156,11 @@ pub fn render_frame(
     // 1b. Proximity pruning — remove discs too close to a more important disc
     if opts.prune_dist > 0.0 {
         let threshold_sq = opts.prune_dist * opts.prune_dist;
-        // Sort: non-ghosts before ghosts, then by z ascending (front first)
+        // Sort by effective z ascending (front/important first, kept over nearby duplicates)
         vis_positions.sort_by(|a, b| {
-            a.is_ghost.cmp(&b.is_ghost).then(a.z.total_cmp(&b.z))
+            let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
+            let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
+            za.total_cmp(&zb)
         });
         let mut kept: Vec<DiscPosition> = Vec::with_capacity(vis_positions.len());
         for p in &vis_positions {
@@ -196,22 +202,42 @@ pub fn render_frame(
     let glitch_color_active = frame_positions.glitch_color_active;
     let glitch_frame = frame_positions.glitch_frame;
 
-    // Single char pass: iterate back-to-front
-    for (ai, a) in asgn.iter().enumerate() {
-        if a.mode != DiscMode::Char {
+    // Two-pass char stamping: ghosts first, then main discs overwrite.
+    // C64 compatible: all stamp cells are written, last writer wins.
+    // Iterate back-to-front (reverse array order) so front discs write last = on top.
+    let mut non_ghost_owner = vec![-1i32; cell_count];
+
+    // Pass 1: ghost discs (background layer, back-to-front)
+    for ai in (0..asgn.len()).rev() {
+        let a = &asgn[ai];
+        if a.mode != DiscMode::Char || !a.is_ghost {
             continue;
         }
         let col = disc_color(a, glitch_color_active, glitch_frame);
         for cell in &a.stamp {
             let idx = cell.row as usize * COLS + cell.col as usize;
-            if idx >= cell_count {
-                continue;
-            }
-            if screen_owner[idx] >= 0 && screen_owner[idx] != ai as i32 {
+            if idx >= cell_count { continue; }
+            screen_ram[idx] = cell.ch;
+            screen_owner[idx] = ai as i32;
+            color_ram[idx] = Some(col);
+        }
+    }
+    // Pass 2: non-ghost discs (overwrite ghosts, back-to-front)
+    for ai in (0..asgn.len()).rev() {
+        let a = &asgn[ai];
+        if a.mode != DiscMode::Char || a.is_ghost {
+            continue;
+        }
+        let col = disc_color(a, glitch_color_active, glitch_frame);
+        for cell in &a.stamp {
+            let idx = cell.row as usize * COLS + cell.col as usize;
+            if idx >= cell_count { continue; }
+            if non_ghost_owner[idx] >= 0 && non_ghost_owner[idx] != ai as i32 {
                 screen_over[idx] = screen_over[idx].saturating_add(1);
             }
             screen_ram[idx] = cell.ch;
             screen_owner[idx] = ai as i32;
+            non_ghost_owner[idx] = ai as i32;
             color_ram[idx] = Some(col);
         }
     }
@@ -253,17 +279,7 @@ pub fn render_frame(
         }
     };
 
-    // 6. Render background sprites (z > 0) — behind chars
-    if opts.show_sprites {
-        for (ai, a) in asgn.iter().enumerate() {
-            if a.mode != DiscMode::Sprite || a.z <= 0.0 { continue; }
-            if let Some(col) = sprite_col(a, ai) {
-                render_sprite(a, &col, true, &char_mask, &mut d);
-            }
-        }
-    }
-
-    // 7. Render chars — paints over background sprites
+    // 6. Render chars
     if opts.show_chars {
         for r in 0..ROWS {
             for c in 0..COLS {
@@ -308,12 +324,82 @@ pub fn render_frame(
         }
     }
 
-    // 8. Render foreground sprites (z <= 0) — on top of chars
+    // 7. Render all sprites — foreground priority ($D01B = 0), on top of chars
     if opts.show_sprites {
         for (ai, a) in asgn.iter().enumerate() {
-            if a.mode != DiscMode::Sprite || a.z > 0.0 { continue; }
+            if a.mode != DiscMode::Sprite { continue; }
             if let Some(col) = sprite_col(a, ai) {
                 render_sprite(a, &col, false, &char_mask, &mut d);
+            }
+        }
+    }
+
+    // 8. Ideal render / error overlay
+    if opts.error_overlay || opts.ideal_render {
+        // Build ideal image: paint all discs back-to-front using sprite bitmap
+        let mut ideal = vec![0u8; C64W * C64H * 3]; // RGB only
+        // Sort by effective z descending (back first, so front paints last = on top)
+        let mut sorted_vis: Vec<&DiscPosition> = vis_positions.iter().collect();
+        sorted_vis.sort_by(|a, b| {
+            let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
+            let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
+            zb.total_cmp(&za) // descending: back first
+        });
+        for p in &sorted_vis {
+            let col = {
+                let a = Assignment {
+                    x: p.x, y: p.y, z: p.z, id: p.id,
+                    is_ghost: p.is_ghost, ghost_depth: p.ghost_depth,
+                    mode: DiscMode::Char, stamp: Vec::new(),
+                };
+                disc_color(&a, glitch_color_active, glitch_frame)
+            };
+            let ox = p.x.floor() as i32 - 8;
+            let oy = p.y.floor() as i32 - 8;
+            for sr in 0..SPRITE_H {
+                let sy = oy + sr as i32;
+                if sy < 0 || sy >= C64H as i32 { continue; }
+                for sc in 0..SPRITE_W {
+                    if spr_pixels[sr * SPRITE_W + sc] == 0 { continue; }
+                    let sx = ox + sc as i32;
+                    if sx < 0 || sx >= C64W as i32 { continue; }
+                    let idx = (sy as usize * C64W + sx as usize) * 3;
+                    ideal[idx] = col[0];
+                    ideal[idx + 1] = col[1];
+                    ideal[idx + 2] = col[2];
+                }
+            }
+        }
+
+        if opts.ideal_render {
+            // Replace C64 output with ideal
+            for y in 0..C64H {
+                for x in 0..C64W {
+                    let rgba_idx = (y * C64W + x) * 4;
+                    let ideal_idx = (y * C64W + x) * 3;
+                    d[rgba_idx] = ideal[ideal_idx];
+                    d[rgba_idx + 1] = ideal[ideal_idx + 1];
+                    d[rgba_idx + 2] = ideal[ideal_idx + 2];
+                }
+            }
+        } else {
+            // Error overlay: compare and tint differences red
+            for y in 0..C64H {
+                for x in 0..C64W {
+                    let rgba_idx = (y * C64W + x) * 4;
+                    let ideal_idx = (y * C64W + x) * 3;
+                    let ar = d[rgba_idx];
+                    let ag = d[rgba_idx + 1];
+                    let ab = d[rgba_idx + 2];
+                    let ir = ideal[ideal_idx];
+                    let ig = ideal[ideal_idx + 1];
+                    let ib = ideal[ideal_idx + 2];
+                    if ar != ir || ag != ig || ab != ib {
+                        d[rgba_idx] = 255;
+                        d[rgba_idx + 1] = 0;
+                        d[rgba_idx + 2] = 0;
+                    }
+                }
             }
         }
     }
