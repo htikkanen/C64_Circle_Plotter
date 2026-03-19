@@ -1,7 +1,9 @@
 mod data;
 mod sim;
 mod render;
+mod optimizer;
 
+use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 // ---------------------------------------------------------------------------
@@ -22,6 +24,19 @@ struct C64App {
     // Timing
     last_time: Option<f64>,
     accum: f64,
+
+    // Optimizer
+    opt_progress: Option<Arc<Mutex<optimizer::OptProgress>>>,
+    opt_frame: Option<usize>,
+    opt_iterations: u64,
+    opt_compare: bool, // true = temporarily show baseline
+
+    // Sequence optimizer
+    seq_results: Vec<Option<optimizer::OptState>>, // per-frame optimized states
+    seq_baselines: Vec<u32>,                       // per-frame baseline errors
+    seq_running: bool,
+    seq_current_frame: usize,
+    seq_total_saved: u32,
 }
 
 impl C64App {
@@ -44,6 +59,15 @@ impl C64App {
             texture: None,
             last_time: None,
             accum: 0.0,
+            opt_progress: None,
+            opt_frame: None,
+            opt_iterations: 5000,
+            opt_compare: false,
+            seq_results: vec![None; data::TOTAL_FRAMES],
+            seq_baselines: vec![0; data::TOTAL_FRAMES],
+            seq_running: false,
+            seq_current_frame: 0,
+            seq_total_saved: 0,
         }
     }
 
@@ -73,9 +97,15 @@ impl C64App {
         }
 
         let positions = sim::gen_positions(self.frame);
+
+        // Use optimized allocation if available for this frame
+        let opt_override = self.get_opt_override();
+        let override_ref = opt_override.as_ref().map(|(a, s)| (a.as_slice(), s.as_slice()));
+
         let (pixels, stats, sl_counts) = render::render_frame(
             &positions,
             &self.opts,
+            override_ref,
         );
 
         // Update counters (only once per frame — avoids inflation on repaints)
@@ -86,6 +116,179 @@ impl C64App {
         }
 
         (pixels, stats, sl_counts)
+    }
+
+    /// Get optimized allocation for current frame, if available.
+    fn get_opt_override(&self) -> Option<(Vec<sim::Assignment>, Vec<Option<u8>>)> {
+        if self.opt_compare { return None; } // compare mode: show baseline
+        // Check single-frame optimization
+        if self.opt_frame == Some(self.frame) {
+            if let Some(ref progress) = self.opt_progress {
+                let p = progress.lock().unwrap();
+                if p.done {
+                    if let Some(ref state) = p.best_state {
+                        return Some((state.asgn.clone(), state.sprite_slot_map.clone()));
+                    }
+                }
+            }
+        }
+        // Check sequence optimization
+        if let Some(ref state) = self.seq_results[self.frame] {
+            return Some((state.asgn.clone(), state.sprite_slot_map.clone()));
+        }
+        None
+    }
+
+    fn start_optimizer(&mut self) {
+        self.playing = false;
+        let frame = self.frame;
+        let positions = sim::gen_positions(frame);
+
+        // Build pruned positions first (same as render_frame does)
+        let mut vis_positions: Vec<sim::DiscPosition> = positions.positions.iter()
+            .filter(|p| !sim::should_skip(p.z))
+            .cloned()
+            .collect();
+        if self.opts.prune_dist > 0.0 {
+            let threshold_sq = self.opts.prune_dist * self.opts.prune_dist;
+            vis_positions.sort_by(|a, b| {
+                let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
+                let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
+                za.total_cmp(&zb)
+            });
+            let mut kept = Vec::with_capacity(vis_positions.len());
+            for p in &vis_positions {
+                let dominated = kept.iter().any(|k: &sim::DiscPosition| {
+                    let dx = p.x - k.x;
+                    let dy = p.y - k.y;
+                    dx * dx + dy * dy < threshold_sq
+                });
+                if !dominated { kept.push(p.clone()); }
+            }
+            kept.sort_by(|a, b| a.z.total_cmp(&b.z));
+            vis_positions = kept;
+        }
+
+        // Allocate on PRUNED positions (same set as render_frame uses)
+        let alloc = sim::allocate(&vis_positions);
+        let initial = optimizer::state_from_alloc(&alloc.asgn, &alloc.sprite_slot_map);
+
+        // Compute baseline error on UI thread to avoid race
+        let baseline = {
+            let ideal = render::render_ideal(&vis_positions, positions.glitch_color_active, positions.glitch_frame);
+            let actual = render::render_c64_image(&initial.asgn, &initial.sprite_slot_map, positions.glitch_color_active, positions.glitch_frame);
+            render::pixel_error(&actual, &ideal)
+        };
+
+        let progress = Arc::new(Mutex::new(optimizer::OptProgress {
+            iterations_done: 0,
+            iterations_total: 0,
+            best_score: baseline,
+            baseline_score: baseline,
+            done: false,
+            best_state: None,
+            sprites_demoted: 0,
+        }));
+        self.opt_progress = Some(Arc::clone(&progress));
+        self.opt_frame = Some(frame);
+
+        let iters = self.opt_iterations;
+        let glitch_color = positions.glitch_color_active;
+        let glitch_frame_val = positions.glitch_frame;
+
+        std::thread::spawn(move || {
+            optimizer::optimize_parallel(
+                vis_positions,
+                initial,
+                glitch_color,
+                glitch_frame_val,
+                iters,
+                progress,
+            );
+        });
+    }
+
+    fn start_sequence_optimizer(&mut self) {
+        self.playing = false;
+        self.seq_running = true;
+        self.seq_current_frame = 0;
+        self.seq_total_saved = 0;
+        self.seq_results = vec![None; data::TOTAL_FRAMES];
+        self.seq_baselines = vec![0; data::TOTAL_FRAMES];
+        self.advance_sequence_optimizer();
+    }
+
+    fn advance_sequence_optimizer(&mut self) {
+        if !self.seq_running || self.seq_current_frame >= data::TOTAL_FRAMES {
+            self.seq_running = false;
+            return;
+        }
+
+        let frame = self.seq_current_frame;
+        let positions = sim::gen_positions(frame);
+        let prune_dist = self.opts.prune_dist;
+        let iters = self.opt_iterations;
+
+        // Build pruned positions
+        let mut vis_positions: Vec<sim::DiscPosition> = positions.positions.iter()
+            .filter(|p| !sim::should_skip(p.z))
+            .cloned()
+            .collect();
+        if prune_dist > 0.0 {
+            let threshold_sq = prune_dist * prune_dist;
+            vis_positions.sort_by(|a, b| {
+                let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
+                let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
+                za.total_cmp(&zb)
+            });
+            let mut kept = Vec::with_capacity(vis_positions.len());
+            for p in &vis_positions {
+                let dominated = kept.iter().any(|k: &sim::DiscPosition| {
+                    let dx = p.x - k.x;
+                    let dy = p.y - k.y;
+                    dx * dx + dy * dy < threshold_sq
+                });
+                if !dominated { kept.push(p.clone()); }
+            }
+            kept.sort_by(|a, b| a.z.total_cmp(&b.z));
+            vis_positions = kept;
+        }
+
+        let alloc = sim::allocate(&vis_positions);
+        let initial = optimizer::state_from_alloc(&alloc.asgn, &alloc.sprite_slot_map);
+
+        let baseline = {
+            let ideal = render::render_ideal(&vis_positions, positions.glitch_color_active, positions.glitch_frame);
+            let actual = render::render_c64_image(&initial.asgn, &initial.sprite_slot_map, positions.glitch_color_active, positions.glitch_frame);
+            render::pixel_error(&actual, &ideal)
+        };
+
+        let progress = Arc::new(Mutex::new(optimizer::OptProgress {
+            iterations_done: 0,
+            iterations_total: 0,
+            best_score: baseline,
+            baseline_score: baseline,
+            done: false,
+            best_state: None,
+            sprites_demoted: 0,
+        }));
+        self.opt_progress = Some(Arc::clone(&progress));
+        self.opt_frame = Some(frame);
+        self.frame = frame;
+
+        let glitch_color = positions.glitch_color_active;
+        let glitch_frame_val = positions.glitch_frame;
+
+        std::thread::spawn(move || {
+            optimizer::optimize_parallel(
+                vis_positions,
+                initial,
+                glitch_color,
+                glitch_frame_val,
+                iters,
+                progress,
+            );
+        });
     }
 }
 
@@ -134,8 +337,33 @@ impl eframe::App for C64App {
             self.last_time = None;
         }
 
+        // Request repaints while optimizer is running
+        let opt_running = self.opt_progress.as_ref().map(|p| !p.lock().unwrap().done).unwrap_or(false);
+        if opt_running {
+            ctx.request_repaint();
+        }
+
+        // Advance sequence optimizer when current frame completes
+        if self.seq_running && !opt_running {
+            if let Some(ref progress) = self.opt_progress {
+                let p = progress.lock().unwrap();
+                if p.done {
+                    let saved = p.baseline_score.saturating_sub(p.best_score);
+                    self.seq_total_saved += saved;
+                    self.seq_baselines[self.seq_current_frame] = p.baseline_score;
+                    if let Some(ref state) = p.best_state {
+                        self.seq_results[self.seq_current_frame] = Some(state.clone());
+                    }
+                    drop(p);
+                    self.seq_current_frame += 1;
+                    self.advance_sequence_optimizer();
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         // --- Render the C64 frame ---
-        let (pixels, stats, sl_counts) = self.render_current_frame();
+        let (pixels, stats, _sl_counts) = self.render_current_frame();
 
         // Build / update texture
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -168,7 +396,7 @@ impl eframe::App for C64App {
             .show(ctx, |ui| {
                 ui.style_mut().visuals.panel_fill = egui::Color32::from_rgb(0x0e, 0x0e, 0x14);
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.draw_sidebar(ui, &stats, &sl_counts);
+                    self.draw_sidebar(ui, &stats);
                 });
             });
 
@@ -177,15 +405,21 @@ impl eframe::App for C64App {
             ui.style_mut().visuals.panel_fill = egui::Color32::from_rgb(0x0c, 0x0c, 0x10);
 
             ui.vertical_centered(|ui| {
-                // Main C64 display
+                // Main C64 display — hold mouse to compare with baseline
                 if let Some(tex) = &self.texture {
                     let size = egui::vec2(
                         (data::C64W * data::SCALE) as f32,
                         (data::C64H * data::SCALE) as f32,
                     );
                     let image = egui::Image::new(tex)
-                        .fit_to_exact_size(size);
-                    ui.add(image);
+                        .fit_to_exact_size(size)
+                        .sense(egui::Sense::click());
+                    let response = ui.add(image);
+                    let was_comparing = self.opt_compare;
+                    self.opt_compare = response.is_pointer_button_down_on();
+                    if self.opt_compare != was_comparing {
+                        ctx.request_repaint();
+                    }
                 }
 
                 ui.add_space(8.0);
@@ -201,6 +435,23 @@ impl eframe::App for C64App {
                 // Phase label
                 let phase = phase_label(self.frame);
                 ui.colored_label(COL_DIM, egui::RichText::new(phase).size(10.0));
+
+                ui.add_space(4.0);
+
+                // Display options under viewport
+                ui.horizontal_wrapped(|ui| {
+                    ui.style_mut().spacing.button_padding = egui::vec2(6.0, 2.0);
+                    option_toggle_compact(ui, "Grid", &mut self.opts.grid);
+                    option_toggle_compact(ui, "Color", &mut self.opts.color);
+                    option_toggle_compact(ui, "IDs", &mut self.opts.ids);
+                    option_toggle_compact(ui, "Corrupt", &mut self.opts.corruption);
+                    option_toggle_compact(ui, "C64", &mut self.opts.c64only);
+                    option_toggle_compact(ui, "Mux", &mut self.opts.mux_overlay);
+                    option_toggle_compact(ui, "Chars", &mut self.opts.show_chars);
+                    option_toggle_compact(ui, "Sprites", &mut self.opts.show_sprites);
+                    option_toggle_compact(ui, "Error", &mut self.opts.error_overlay);
+                    option_toggle_compact(ui, "Ideal", &mut self.opts.ideal_render);
+                });
             });
         });
     }
@@ -224,8 +475,16 @@ impl C64App {
                 }
             }
 
-            // Step
-            if ui.button("Step").clicked() {
+            // Step back/forward
+            if ui.button("<").clicked() {
+                self.playing = false;
+                if self.frame == 0 {
+                    self.frame = data::TOTAL_FRAMES - 1;
+                } else {
+                    self.frame -= 1;
+                }
+            }
+            if ui.button(">").clicked() {
                 self.playing = false;
                 self.advance_frame();
             }
@@ -276,7 +535,7 @@ impl C64App {
             (data::C64W * data::SCALE) as f32,
             32.0,
         );
-        let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::click());
+        let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::click_and_drag());
         let rect = response.rect;
 
         // Phase segments
@@ -309,13 +568,14 @@ impl C64App {
         // Border
         painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, COL_BORDER), egui::StrokeKind::Outside);
 
-        // Click to seek
-        if response.clicked() {
+        // Click or drag to seek/scan
+        if response.clicked() || response.dragged() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                self.frame = (t * data::TOTAL_FRAMES as f32) as usize;
-                if self.frame >= data::TOTAL_FRAMES {
-                    self.frame = data::TOTAL_FRAMES - 1;
+                let new_frame = ((t * data::TOTAL_FRAMES as f32) as usize).min(data::TOTAL_FRAMES - 1);
+                if new_frame != self.frame {
+                    self.frame = new_frame;
+                    self.playing = false;
                 }
             }
         }
@@ -324,7 +584,7 @@ impl C64App {
     // -----------------------------------------------------------------------
     // Sidebar panels
     // -----------------------------------------------------------------------
-    fn draw_sidebar(&mut self, ui: &mut egui::Ui, stats: &render::FrameStats, sl_counts: &[u8]) {
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui, stats: &render::FrameStats) {
         // -- Legend --
         draw_panel(ui, "LEGEND", |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -372,115 +632,115 @@ impl C64App {
             );
         });
 
-        // -- Scanline Sprites visualization --
-        draw_panel(ui, "SCANLINE SPRITES", |ui| {
-            self.draw_scanline_viz(ui, sl_counts);
-        });
-
-        // -- Display Options --
-        draw_panel(ui, "DISPLAY", |ui| {
-            ui.columns(2, |cols| {
-                option_toggle(&mut cols[0], "Grid", &mut self.opts.grid);
-                option_toggle(&mut cols[1], "Color code", &mut self.opts.color);
-            });
-            ui.columns(2, |cols| {
-                option_toggle(&mut cols[0], "IDs", &mut self.opts.ids);
-                option_toggle(&mut cols[1], "Corruption", &mut self.opts.corruption);
-            });
-            ui.columns(2, |cols| {
-                option_toggle(&mut cols[0], "C64 only", &mut self.opts.c64only);
-                option_toggle(&mut cols[1], "Mux zones", &mut self.opts.mux);
-            });
-            ui.columns(2, |cols| {
-                option_toggle(&mut cols[0], "Chars", &mut self.opts.show_chars);
-                option_toggle(&mut cols[1], "Sprites", &mut self.opts.show_sprites);
-            });
-            ui.columns(2, |cols| {
-                option_toggle(&mut cols[0], "Error overlay", &mut self.opts.error_overlay);
-                option_toggle(&mut cols[1], "Ideal render", &mut self.opts.ideal_render);
-            });
-            ui.add_space(4.0);
+        // -- Optimizer --
+        draw_panel(ui, "OPTIMIZER", |ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(COL_DIM, egui::RichText::new("Prune dist").size(10.0));
-                let slider = egui::Slider::new(&mut self.opts.prune_dist, 0.0..=8.0)
+                ui.add(egui::Slider::new(&mut self.opts.prune_dist, 0.0..=8.0)
                     .step_by(0.5)
                     .custom_formatter(|v, _| {
                         if v == 0.0 { "off".to_string() } else { format!("{:.1}px", v) }
-                    });
-                ui.add(slider);
+                    }));
             });
+            ui.horizontal(|ui| {
+                ui.colored_label(COL_DIM, egui::RichText::new("Iters/core").size(10.0));
+                ui.add(egui::Slider::new(&mut self.opt_iterations, 1000..=50000)
+                    .step_by(1000.0)
+                    .show_value(true));
+            });
+
+            // Show baseline: from single-frame opt, sequence opt, or live
+            let baseline = if self.opt_frame == Some(self.frame) {
+                self.opt_progress.as_ref()
+                    .map(|p| p.lock().unwrap().baseline_score)
+                    .unwrap_or(stats.pixel_error)
+            } else if self.seq_baselines[self.frame] > 0 {
+                self.seq_baselines[self.frame]
+            } else {
+                stats.pixel_error
+            };
+            stat_row(ui, "Baseline error", &baseline.to_string(), COL_DIM);
+
+            let is_running = self.opt_progress.as_ref()
+                .map(|p| !p.lock().unwrap().done)
+                .unwrap_or(false);
+
+            if is_running {
+                let p = self.opt_progress.as_ref().unwrap().lock().unwrap();
+                let pct = if p.iterations_total > 0 {
+                    (p.iterations_done as f32 / p.iterations_total as f32 * 100.0).min(100.0)
+                } else { 0.0 };
+                ui.colored_label(COL_ACCENT, egui::RichText::new(
+                    format!("Running... {:.0}%", pct)).size(11.0));
+                stat_row(ui, "Best error", &p.best_score.to_string(), COL_SPRITE);
+            } else {
+                let has_result = self.opt_frame == Some(self.frame)
+                    && self.opt_progress.as_ref().map(|p| p.lock().unwrap().done).unwrap_or(false);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Optimize frame").clicked() {
+                        self.start_optimizer();
+                    }
+                    if has_result {
+                        if ui.button("Reset").clicked() {
+                            self.opt_progress = None;
+                            self.opt_frame = None;
+                        }
+                    }
+                });
+
+                let has_result = self.opt_frame == Some(self.frame)
+                    && self.opt_progress.as_ref().map(|p| p.lock().unwrap().done).unwrap_or(false);
+                if has_result {
+                    let p = self.opt_progress.as_ref().unwrap().lock().unwrap();
+                    stat_row(ui, "Optimized error", &p.best_score.to_string(), COL_CHAR);
+                    stat_row(ui, "Pixels saved",
+                        &p.baseline_score.saturating_sub(p.best_score).to_string(), COL_ACCENT);
+                    if p.sprites_demoted > 0 {
+                        stat_row(ui, "Sprites→stamps", &p.sprites_demoted.to_string(), COL_DIM);
+                    }
+                    ui.colored_label(COL_DIM, egui::RichText::new(
+                        "Hold mouse on viewport to compare").size(9.0));
+                } else {
+                    stat_row(ui, "Current error", &stats.pixel_error.to_string(), COL_DIM);
+                }
+            }
+
+            ui.separator();
+
+            // Sequence optimizer
+            if self.seq_running {
+                let pct = self.seq_current_frame as f32 / data::TOTAL_FRAMES as f32 * 100.0;
+                ui.colored_label(COL_ACCENT, egui::RichText::new(
+                    format!("Sequence: frame {}/{} ({:.0}%)", self.seq_current_frame, data::TOTAL_FRAMES, pct)
+                ).size(11.0));
+                stat_row(ui, "Total saved", &self.seq_total_saved.to_string(), COL_CHAR);
+                if ui.button("Stop").clicked() {
+                    self.seq_running = false;
+                }
+            } else {
+                let seq_count = self.seq_results.iter().filter(|r| r.is_some()).count();
+                if seq_count > 0 {
+                    stat_row(ui, "Optimized frames",
+                        &format!("{}/{}", seq_count, data::TOTAL_FRAMES), COL_CHAR);
+                    stat_row(ui, "Total saved", &self.seq_total_saved.to_string(), COL_ACCENT);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Optimize sequence").clicked() {
+                        self.start_sequence_optimizer();
+                    }
+                    if seq_count > 0 {
+                        if ui.button("Clear all").clicked() {
+                            self.seq_results = vec![None; data::TOTAL_FRAMES];
+                            self.seq_baselines = vec![0; data::TOTAL_FRAMES];
+                            self.seq_total_saved = 0;
+                        }
+                    }
+                });
+            }
         });
     }
 
-    // -----------------------------------------------------------------------
-    // Scanline sprites bar chart
-    // -----------------------------------------------------------------------
-    fn draw_scanline_viz(&self, ui: &mut egui::Ui, sl_counts: &[u8]) {
-        let desired_size = egui::vec2(ui.available_width(), 160.0);
-        let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::hover());
-        let rect = response.rect;
-
-        // Background
-        painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(0x0a, 0x0a, 0x10));
-
-        let max_v = sl_counts.iter().copied().max().unwrap_or(0).max(data::MAX_SPR_LINE as u8 + 2) as f32;
-
-        // Limit line at MAX_SPR_LINE
-        let limit_y = rect.bottom() - (data::MAX_SPR_LINE as f32 / max_v) * rect.height();
-
-        // Danger zone shading above limit
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.top()),
-                egui::pos2(rect.right(), limit_y),
-            ),
-            0.0,
-            egui::Color32::from_rgba_premultiplied(255, 107, 107, 25),
-        );
-
-        // Dashed limit line
-        painter.line_segment(
-            [egui::pos2(rect.left(), limit_y), egui::pos2(rect.right(), limit_y)],
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 107, 107, 77)),
-        );
-
-        // "8" label
-        painter.text(
-            egui::pos2(rect.right() - 3.0, limit_y - 2.0),
-            egui::Align2::RIGHT_BOTTOM,
-            "8",
-            egui::FontId::monospace(8.0),
-            egui::Color32::from_rgba_premultiplied(255, 107, 107, 100),
-        );
-
-        // Bars
-        let bar_w = rect.width() / data::C64H as f32;
-        for i in 0..data::C64H {
-            let count = sl_counts.get(i).copied().unwrap_or(0);
-            if count == 0 {
-                continue;
-            }
-            let bar_h = (count as f32 / max_v) * rect.height();
-            let color = if count as usize > data::MAX_SPR_LINE {
-                egui::Color32::from_rgba_premultiplied(255, 212, 59, 178)
-            } else {
-                egui::Color32::from_rgba_premultiplied(255, 107, 107, 128)
-            };
-            let bar_rect = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + i as f32 * bar_w, rect.bottom() - bar_h),
-                egui::pos2(rect.left() + i as f32 * bar_w + (bar_w - 0.5).max(1.0), rect.bottom()),
-            );
-            painter.rect_filled(bar_rect, 0.0, color);
-        }
-
-        // Border
-        painter.rect_stroke(
-            rect,
-            4.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x1a, 0x1a, 0x25)),
-            egui::StrokeKind::Outside,
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -521,8 +781,8 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, value_color: egui::Colo
     });
 }
 
-fn option_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) {
-    let text = egui::RichText::new(label).size(10.0);
+fn option_toggle_compact(ui: &mut egui::Ui, label: &str, value: &mut bool) {
+    let text = egui::RichText::new(label).size(9.0);
     let btn = if *value {
         egui::Button::new(text.color(COL_ACCENT))
             .fill(egui::Color32::from_rgb(0x1a, 0x1a, 0x35))
@@ -532,7 +792,7 @@ fn option_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) {
             .fill(egui::Color32::from_rgb(0x15, 0x15, 0x20))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0x22, 0x23, 0x33)))
     };
-    if ui.add_sized(egui::vec2(ui.available_width(), 22.0), btn).clicked() {
+    if ui.add(btn).clicked() {
         *value = !*value;
     }
 }

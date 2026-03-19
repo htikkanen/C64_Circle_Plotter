@@ -797,7 +797,7 @@ pub fn gen_positions(f: usize) -> FramePositions {
 // allocate
 // ---------------------------------------------------------------------------
 
-fn try_mux_fit(sprite_list: &[(f64, f64)]) -> bool {
+pub fn try_mux_fit(sprite_list: &[(f64, f64)]) -> bool {
     // Each entry is (x, y). We need topY = floor(y) - 8.
     let mut infos: Vec<(usize, i32)> = sprite_list
         .iter()

@@ -36,12 +36,12 @@ pub struct DisplayOpts {
     pub ids: bool,
     pub corruption: bool,
     pub c64only: bool,
-    pub mux: bool,
     pub show_chars: bool,
     pub show_sprites: bool,
     pub prune_dist: f64,
     pub error_overlay: bool,
     pub ideal_render: bool,
+    pub mux_overlay: bool,
 }
 
 impl Default for DisplayOpts {
@@ -52,12 +52,12 @@ impl Default for DisplayOpts {
             ids: false,
             corruption: true,
             c64only: true,
-            mux: false,
             show_chars: true,
             show_sprites: true,
             prune_dist: 2.0,
             error_overlay: false,
             ideal_render: false,
+            mux_overlay: false,
         }
     }
 }
@@ -79,6 +79,7 @@ pub struct FrameStats {
     pub mem_discs: usize,
     pub on_screen_count: usize,
     pub mem_bytes: usize,
+    pub pixel_error: u32,
 }
 
 // ============================================================
@@ -130,6 +131,178 @@ pub fn disc_color(a: &Assignment, glitch_color_active: bool, glitch_frame: usize
 }
 
 // ============================================================
+// Standalone render functions for optimizer scoring
+// ============================================================
+
+/// Render ideal image: all discs as perfect circles, back-to-front, no C64 constraints.
+/// Returns RGB buffer (C64W * C64H * 3).
+pub fn render_ideal(
+    vis_positions: &[DiscPosition],
+    glitch_color_active: bool,
+    glitch_frame: usize,
+) -> Vec<u8> {
+    let spr_pixels = &*SPR_PIXELS;
+    let mut buf = vec![0u8; C64W * C64H * 3];
+
+    // Sort by effective z descending (back first, front paints last = on top)
+    let mut sorted: Vec<&DiscPosition> = vis_positions.iter().collect();
+    sorted.sort_by(|a, b| {
+        let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
+        let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
+        zb.total_cmp(&za)
+    });
+
+    for p in &sorted {
+        let col = {
+            let a = Assignment {
+                x: p.x, y: p.y, z: p.z, id: p.id,
+                is_ghost: p.is_ghost, ghost_depth: p.ghost_depth,
+                mode: DiscMode::Char, stamp: Vec::new(),
+            };
+            disc_color(&a, glitch_color_active, glitch_frame)
+        };
+        let ox = p.x.floor() as i32 - 8;
+        let oy = p.y.floor() as i32 - 8;
+        for sr in 0..SPRITE_H {
+            let sy = oy + sr as i32;
+            if sy < 0 || sy >= C64H as i32 { continue; }
+            for sc in 0..SPRITE_W {
+                if spr_pixels[sr * SPRITE_W + sc] == 0 { continue; }
+                let sx = ox + sc as i32;
+                if sx < 0 || sx >= C64W as i32 { continue; }
+                let idx = (sy as usize * C64W + sx as usize) * 3;
+                buf[idx] = col[0];
+                buf[idx + 1] = col[1];
+                buf[idx + 2] = col[2];
+            }
+        }
+    }
+    buf
+}
+
+/// Render C64-accurate image from assignments. Returns RGB buffer (C64W * C64H * 3).
+pub fn render_c64_image(
+    asgn: &[Assignment],
+    sprite_slot_map: &[Option<u8>],
+    glitch_color_active: bool,
+    glitch_frame: usize,
+) -> Vec<u8> {
+    let spr_pixels = &*SPR_PIXELS;
+    let char_pixels = &*CHAR_PIXELS;
+    let cell_count = ROWS * COLS;
+    let mut screen_ram = vec![EMPTY_IDX as u16; cell_count];
+    let mut color_ram: Vec<Option<[u8; 3]>> = vec![None; cell_count];
+
+    // Char stamping: ghosts back-to-front, then non-ghosts back-to-front
+    for ai in (0..asgn.len()).rev() {
+        let a = &asgn[ai];
+        if a.mode != DiscMode::Char || !a.is_ghost { continue; }
+        let col = disc_color(a, glitch_color_active, glitch_frame);
+        for cell in &a.stamp {
+            let idx = cell.row as usize * COLS + cell.col as usize;
+            if idx >= cell_count { continue; }
+            screen_ram[idx] = cell.ch;
+            color_ram[idx] = Some(col);
+        }
+    }
+    for ai in (0..asgn.len()).rev() {
+        let a = &asgn[ai];
+        if a.mode != DiscMode::Char || a.is_ghost { continue; }
+        let col = disc_color(a, glitch_color_active, glitch_frame);
+        for cell in &a.stamp {
+            let idx = cell.row as usize * COLS + cell.col as usize;
+            if idx >= cell_count { continue; }
+            screen_ram[idx] = cell.ch;
+            color_ram[idx] = Some(col);
+        }
+    }
+
+    let mut buf = vec![0u8; C64W * C64H * 3];
+
+    // Paint ghost sprites (background, $D01B=1, behind chars)
+    for slot in (0..8u8).rev() {
+        for (ai, a) in asgn.iter().enumerate() {
+            if a.mode != DiscMode::Sprite || !a.is_ghost { continue; }
+            if sprite_slot_map.get(ai).and_then(|s| *s) != Some(slot) { continue; }
+            let col = disc_color(a, glitch_color_active, glitch_frame);
+            let ox = a.x.floor() as i32 - 8;
+            let oy = a.y.floor() as i32 - 8;
+            for sr in 0..SPRITE_H {
+                let sy = oy + sr as i32;
+                if sy < 0 || sy >= C64H as i32 { continue; }
+                for sc in 0..SPRITE_W {
+                    if spr_pixels[sr * SPRITE_W + sc] == 0 { continue; }
+                    let sx = ox + sc as i32;
+                    if sx < 0 || sx >= C64W as i32 { continue; }
+                    let idx = (sy as usize * C64W + sx as usize) * 3;
+                    buf[idx] = col[0];
+                    buf[idx + 1] = col[1];
+                    buf[idx + 2] = col[2];
+                }
+            }
+        }
+    }
+
+    // Paint chars to buffer
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let ch_idx = screen_ram[r * COLS + c];
+            let cpx = &char_pixels[ch_idx as usize];
+            let fg = color_ram[r * COLS + c].unwrap_or([0, 0, 0]);
+            let bx = c * CHW;
+            let by = r * CHH;
+            for py in 0..8usize {
+                for px in 0..8usize {
+                    if cpx[py * 8 + px] != 0 {
+                        let sx = bx + px;
+                        let sy = by + py;
+                        if sx < C64W && sy < C64H {
+                            let idx = (sy * C64W + sx) * 3;
+                            buf[idx] = fg[0];
+                            buf[idx + 1] = fg[1];
+                            buf[idx + 2] = fg[2];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Paint non-ghost sprites on top (foreground, $D01B = 0)
+    // Reverse slot order: slot 7 first → slot 0 last (highest priority on top)
+    for slot in (0..8u8).rev() {
+        for (ai, a) in asgn.iter().enumerate() {
+            if a.mode != DiscMode::Sprite || a.is_ghost { continue; }
+            if sprite_slot_map.get(ai).and_then(|s| *s) != Some(slot) { continue; }
+            let col = disc_color(a, glitch_color_active, glitch_frame);
+            let ox = a.x.floor() as i32 - 8;
+            let oy = a.y.floor() as i32 - 8;
+            for sr in 0..SPRITE_H {
+                let sy = oy + sr as i32;
+                if sy < 0 || sy >= C64H as i32 { continue; }
+                for sc in 0..SPRITE_W {
+                    if spr_pixels[sr * SPRITE_W + sc] == 0 { continue; }
+                    let sx = ox + sc as i32;
+                    if sx < 0 || sx >= C64W as i32 { continue; }
+                    let idx = (sy as usize * C64W + sx as usize) * 3;
+                    buf[idx] = col[0];
+                    buf[idx + 1] = col[1];
+                    buf[idx + 2] = col[2];
+                }
+            }
+        }
+    }
+    buf
+}
+
+/// Count pixels that differ between two RGB buffers.
+pub fn pixel_error(actual: &[u8], ideal: &[u8]) -> u32 {
+    actual.chunks_exact(3).zip(ideal.chunks_exact(3))
+        .filter(|(a, i)| a[0] != i[0] || a[1] != i[1] || a[2] != i[2])
+        .count() as u32
+}
+
+// ============================================================
 // Main rendering entry point
 // ============================================================
 
@@ -142,6 +315,7 @@ pub fn disc_color(a: &Assignment, glitch_color_active: bool, glitch_frame: usize
 pub fn render_frame(
     frame_positions: &FramePositions,
     opts: &DisplayOpts,
+    override_alloc: Option<(&[Assignment], &[Option<u8>])>,
 ) -> (Vec<u8>, FrameStats, Vec<u8>) {
     let spr_pixels = &*SPR_PIXELS;
     let char_pixels = &*CHAR_PIXELS;
@@ -178,10 +352,38 @@ pub fn render_frame(
         vis_positions = kept;
     }
 
-    // 2. Allocate visible positions
-    let AllocResult {
-        asgn, sl_counts, sprite_slot_map, max_sl, mux_overflows, mux_used, conflicts,
-    } = allocate(&vis_positions);
+    // 2. Allocate visible positions (or use optimizer override)
+    let (asgn, sl_counts, sprite_slot_map, max_sl, mux_overflows, mux_used, conflicts);
+    if let Some((ov_asgn, ov_slots)) = override_alloc {
+        asgn = ov_asgn.to_vec();
+        sprite_slot_map = ov_slots.to_vec();
+        // Recompute stats from override
+        let mut sl = vec![0u8; C64H];
+        for (ai, a) in asgn.iter().enumerate() {
+            if a.mode != DiscMode::Sprite { continue; }
+            if ov_slots.get(ai).and_then(|s| *s).is_none() { continue; }
+            let top = ((a.y.floor() as i32) - 8).max(0) as usize;
+            let bot = ((a.y.floor() as i32) - 8 + SPRITE_H as i32 - 1).min(C64H as i32 - 1) as usize;
+            for s in top..=bot { sl[s] += 1; }
+        }
+        max_sl = *sl.iter().max().unwrap_or(&0);
+        sl_counts = sl;
+        mux_overflows = 0;
+        mux_used = asgn.iter().enumerate()
+            .filter(|(i, a)| a.mode == DiscMode::Sprite && ov_slots.get(*i).and_then(|s| *s).is_some())
+            .filter_map(|(i, _)| ov_slots[i])
+            .max().map(|s| s + 1).unwrap_or(0);
+        conflicts = 0; // optimizer already minimized these
+    } else {
+        let result = allocate(&vis_positions);
+        asgn = result.asgn;
+        sl_counts = result.sl_counts;
+        sprite_slot_map = result.sprite_slot_map;
+        max_sl = result.max_sl;
+        mux_overflows = result.mux_overflows;
+        mux_used = result.mux_used;
+        conflicts = result.conflicts;
+    }
 
     // 3. Initialise RGBA buffer to black with full alpha
     let buf_len = C64W * C64H * 4;
@@ -201,6 +403,31 @@ pub fn render_frame(
     // Determine glitch state from FramePositions
     let glitch_color_active = frame_positions.glitch_color_active;
     let glitch_frame = frame_positions.glitch_frame;
+
+    // 4a. Render ghost sprites — background priority ($D01B=1), behind chars
+    //     Mux IRQ sets $D01B per instance, so this is C64 compatible.
+    if opts.show_sprites {
+        for slot in (0..8u8).rev() {
+            for (ai, a) in asgn.iter().enumerate() {
+                if a.mode != DiscMode::Sprite || !a.is_ghost { continue; }
+                if sprite_slot_map.get(ai).and_then(|s| *s) != Some(slot) { continue; }
+                let col = disc_color(a, glitch_color_active, glitch_frame);
+                let ox = a.x.floor() as i32 - 8;
+                let oy = a.y.floor() as i32 - 8;
+                for sr in 0..SPRITE_H {
+                    let sy = oy + sr as i32;
+                    if sy < 0 || sy >= C64H as i32 { continue; }
+                    for sc in 0..SPRITE_W {
+                        if spr_pixels[sr * SPRITE_W + sc] == 0 { continue; }
+                        let sx = ox + sc as i32;
+                        if sx < 0 || sx >= C64W as i32 { continue; }
+                        let idx = (sy as usize * C64W + sx as usize) * 4;
+                        set_rgb(&mut d, idx, col);
+                    }
+                }
+            }
+        }
+    }
 
     // Two-pass char stamping: ghosts first, then main discs overwrite.
     // C64 compatible: all stamp cells are written, last writer wins.
@@ -324,52 +551,23 @@ pub fn render_frame(
         }
     }
 
-    // 7. Render all sprites — foreground priority ($D01B = 0), on top of chars
+    // 7. Render non-ghost sprites — foreground priority ($D01B = 0)
+    //    Reverse slot order: slot 7 first → slot 0 last (highest priority on top)
     if opts.show_sprites {
-        for (ai, a) in asgn.iter().enumerate() {
-            if a.mode != DiscMode::Sprite { continue; }
-            if let Some(col) = sprite_col(a, ai) {
-                render_sprite(a, &col, false, &char_mask, &mut d);
+        for slot in (0..8u8).rev() {
+            for (ai, a) in asgn.iter().enumerate() {
+                if a.mode != DiscMode::Sprite || a.is_ghost { continue; }
+                if sprite_slot_map.get(ai).and_then(|s| *s) != Some(slot) { continue; }
+                if let Some(col) = sprite_col(a, ai) {
+                    render_sprite(a, &col, false, &char_mask, &mut d);
+                }
             }
         }
     }
 
     // 8. Ideal render / error overlay
     if opts.error_overlay || opts.ideal_render {
-        // Build ideal image: paint all discs back-to-front using sprite bitmap
-        let mut ideal = vec![0u8; C64W * C64H * 3]; // RGB only
-        // Sort by effective z descending (back first, so front paints last = on top)
-        let mut sorted_vis: Vec<&DiscPosition> = vis_positions.iter().collect();
-        sorted_vis.sort_by(|a, b| {
-            let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
-            let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
-            zb.total_cmp(&za) // descending: back first
-        });
-        for p in &sorted_vis {
-            let col = {
-                let a = Assignment {
-                    x: p.x, y: p.y, z: p.z, id: p.id,
-                    is_ghost: p.is_ghost, ghost_depth: p.ghost_depth,
-                    mode: DiscMode::Char, stamp: Vec::new(),
-                };
-                disc_color(&a, glitch_color_active, glitch_frame)
-            };
-            let ox = p.x.floor() as i32 - 8;
-            let oy = p.y.floor() as i32 - 8;
-            for sr in 0..SPRITE_H {
-                let sy = oy + sr as i32;
-                if sy < 0 || sy >= C64H as i32 { continue; }
-                for sc in 0..SPRITE_W {
-                    if spr_pixels[sr * SPRITE_W + sc] == 0 { continue; }
-                    let sx = ox + sc as i32;
-                    if sx < 0 || sx >= C64W as i32 { continue; }
-                    let idx = (sy as usize * C64W + sx as usize) * 3;
-                    ideal[idx] = col[0];
-                    ideal[idx + 1] = col[1];
-                    ideal[idx + 2] = col[2];
-                }
-            }
-        }
+        let ideal = render_ideal(&vis_positions, glitch_color_active, glitch_frame);
 
         if opts.ideal_render {
             // Replace C64 output with ideal
@@ -404,7 +602,22 @@ pub fn render_frame(
         }
     }
 
-    // 9. Compute memory stats (pixel-level occlusion) — uses pruned positions
+    // 9. Mux capacity overlay — highlight scanlines at max sprites
+    if opts.mux_overlay {
+        for y in 0..C64H {
+            let count = sl_counts.get(y).copied().unwrap_or(0) as usize;
+            if count >= MAX_SPR_LINE {
+                for x in 0..C64W {
+                    let idx = (y * C64W + x) * 4;
+                    d[idx] = ((d[idx] as u16 + 180) / 2) as u8;
+                    d[idx + 1] = ((d[idx + 1] as u16 + 40) / 2) as u8;
+                    d[idx + 2] = ((d[idx + 2] as u16 + 40) / 2) as u8;
+                }
+            }
+        }
+    }
+
+    // 10. Compute memory stats (pixel-level occlusion) — uses pruned positions
     let mut mem_positions: Vec<&DiscPosition> = vis_positions
         .iter()
         .filter(|p| {
@@ -461,6 +674,13 @@ pub fn render_frame(
         }
     }
 
+    // Compute pixel error vs ideal (c64only mode comparison)
+    let pe = {
+        let ideal = render_ideal(&vis_positions, glitch_color_active, glitch_frame);
+        let c64_rgb = render_c64_image(&asgn, &sprite_slot_map, glitch_color_active, glitch_frame);
+        pixel_error(&c64_rgb, &ideal)
+    };
+
     let stats = FrameStats {
         total: asgn.len(),
         visible: sprites + chars,
@@ -473,6 +693,7 @@ pub fn render_frame(
         mem_discs,
         on_screen_count,
         mem_bytes,
+        pixel_error: pe,
     };
 
     (d, stats, sl_counts)
