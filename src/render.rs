@@ -327,30 +327,8 @@ pub fn render_frame(
         .cloned()
         .collect();
 
-    // 1b. Proximity pruning — remove discs too close to a more important disc
-    if opts.prune_dist > 0.0 {
-        let threshold_sq = opts.prune_dist * opts.prune_dist;
-        // Sort by effective z ascending (front/important first, kept over nearby duplicates)
-        vis_positions.sort_by(|a, b| {
-            let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
-            let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
-            za.total_cmp(&zb)
-        });
-        let mut kept: Vec<DiscPosition> = Vec::with_capacity(vis_positions.len());
-        for p in &vis_positions {
-            let dominated = kept.iter().any(|k| {
-                let dx = p.x - k.x;
-                let dy = p.y - k.y;
-                dx * dx + dy * dy < threshold_sq
-            });
-            if !dominated {
-                kept.push(p.clone());
-            }
-        }
-        // Restore original z-sort order (front-to-back)
-        kept.sort_by(|a, b| a.z.total_cmp(&b.z));
-        vis_positions = kept;
-    }
+    // 1b. Proximity pruning
+    prune_by_proximity(&mut vis_positions, opts.prune_dist);
 
     // 2. Allocate visible positions (or use optimizer override)
     let (asgn, sl_counts, sprite_slot_map, max_sl, mux_overflows, mux_used, conflicts);
@@ -674,11 +652,14 @@ pub fn render_frame(
         }
     }
 
-    // Compute pixel error vs ideal (c64only mode comparison)
-    let pe = {
-        let ideal = render_ideal(&vis_positions, glitch_color_active, glitch_frame);
+    // Compute pixel error only when needed (error overlay already computed ideal above)
+    let pe = if opts.error_overlay || opts.ideal_render {
+        // Ideal was already rendered in step 8 — reuse the comparison
         let c64_rgb = render_c64_image(&asgn, &sprite_slot_map, glitch_color_active, glitch_frame);
+        let ideal = render_ideal(&vis_positions, glitch_color_active, glitch_frame);
         pixel_error(&c64_rgb, &ideal)
+    } else {
+        0
     };
 
     let stats = FrameStats {

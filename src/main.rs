@@ -9,6 +9,12 @@ use eframe::egui;
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
+#[derive(Clone, Default)]
+struct SeqFrame {
+    result: Option<optimizer::OptState>,
+    baseline: u32,
+}
+
 struct C64App {
     frame: usize,
     playing: bool,
@@ -32,8 +38,7 @@ struct C64App {
     opt_compare: bool, // true = temporarily show baseline
 
     // Sequence optimizer
-    seq_results: Vec<Option<optimizer::OptState>>, // per-frame optimized states
-    seq_baselines: Vec<u32>,                       // per-frame baseline errors
+    seq_frames: Vec<SeqFrame>,
     seq_running: bool,
     seq_current_frame: usize,
     seq_total_saved: u32,
@@ -63,8 +68,7 @@ impl C64App {
             opt_frame: None,
             opt_iterations: 5000,
             opt_compare: false,
-            seq_results: vec![None; data::TOTAL_FRAMES],
-            seq_baselines: vec![0; data::TOTAL_FRAMES],
+            seq_frames: vec![SeqFrame::default(); data::TOTAL_FRAMES],
             seq_running: false,
             seq_current_frame: 0,
             seq_total_saved: 0,
@@ -133,7 +137,7 @@ impl C64App {
             }
         }
         // Check sequence optimization
-        if let Some(ref state) = self.seq_results[self.frame] {
+        if let Some(ref state) = self.seq_frames[self.frame].result {
             return Some((state.asgn.clone(), state.sprite_slot_map.clone()));
         }
         None
@@ -144,32 +148,13 @@ impl C64App {
         let frame = self.frame;
         let positions = sim::gen_positions(frame);
 
-        // Build pruned positions first (same as render_frame does)
         let mut vis_positions: Vec<sim::DiscPosition> = positions.positions.iter()
             .filter(|p| !sim::should_skip(p.z))
             .cloned()
             .collect();
-        if self.opts.prune_dist > 0.0 {
-            let threshold_sq = self.opts.prune_dist * self.opts.prune_dist;
-            vis_positions.sort_by(|a, b| {
-                let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
-                let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
-                za.total_cmp(&zb)
-            });
-            let mut kept = Vec::with_capacity(vis_positions.len());
-            for p in &vis_positions {
-                let dominated = kept.iter().any(|k: &sim::DiscPosition| {
-                    let dx = p.x - k.x;
-                    let dy = p.y - k.y;
-                    dx * dx + dy * dy < threshold_sq
-                });
-                if !dominated { kept.push(p.clone()); }
-            }
-            kept.sort_by(|a, b| a.z.total_cmp(&b.z));
-            vis_positions = kept;
-        }
+        sim::prune_by_proximity(&mut vis_positions, self.opts.prune_dist);
 
-        // Allocate on PRUNED positions (same set as render_frame uses)
+        // Allocate on pruned positions (same set as render_frame uses)
         let alloc = sim::allocate(&vis_positions);
         let initial = optimizer::state_from_alloc(&alloc.asgn, &alloc.sprite_slot_map);
 
@@ -213,8 +198,7 @@ impl C64App {
         self.seq_running = true;
         self.seq_current_frame = 0;
         self.seq_total_saved = 0;
-        self.seq_results = vec![None; data::TOTAL_FRAMES];
-        self.seq_baselines = vec![0; data::TOTAL_FRAMES];
+        self.seq_frames = vec![SeqFrame::default(); data::TOTAL_FRAMES];
         self.advance_sequence_optimizer();
     }
 
@@ -229,30 +213,11 @@ impl C64App {
         let prune_dist = self.opts.prune_dist;
         let iters = self.opt_iterations;
 
-        // Build pruned positions
         let mut vis_positions: Vec<sim::DiscPosition> = positions.positions.iter()
             .filter(|p| !sim::should_skip(p.z))
             .cloned()
             .collect();
-        if prune_dist > 0.0 {
-            let threshold_sq = prune_dist * prune_dist;
-            vis_positions.sort_by(|a, b| {
-                let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
-                let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
-                za.total_cmp(&zb)
-            });
-            let mut kept = Vec::with_capacity(vis_positions.len());
-            for p in &vis_positions {
-                let dominated = kept.iter().any(|k: &sim::DiscPosition| {
-                    let dx = p.x - k.x;
-                    let dy = p.y - k.y;
-                    dx * dx + dy * dy < threshold_sq
-                });
-                if !dominated { kept.push(p.clone()); }
-            }
-            kept.sort_by(|a, b| a.z.total_cmp(&b.z));
-            vis_positions = kept;
-        }
+        sim::prune_by_proximity(&mut vis_positions, prune_dist);
 
         let alloc = sim::allocate(&vis_positions);
         let initial = optimizer::state_from_alloc(&alloc.asgn, &alloc.sprite_slot_map);
@@ -350,9 +315,9 @@ impl eframe::App for C64App {
                 if p.done {
                     let saved = p.baseline_score.saturating_sub(p.best_score);
                     self.seq_total_saved += saved;
-                    self.seq_baselines[self.seq_current_frame] = p.baseline_score;
+                    self.seq_frames[self.seq_current_frame].baseline = p.baseline_score;
                     if let Some(ref state) = p.best_state {
-                        self.seq_results[self.seq_current_frame] = Some(state.clone());
+                        self.seq_frames[self.seq_current_frame].result = Some(state.clone());
                     }
                     drop(p);
                     self.seq_current_frame += 1;
@@ -654,8 +619,8 @@ impl C64App {
                 self.opt_progress.as_ref()
                     .map(|p| p.lock().unwrap().baseline_score)
                     .unwrap_or(stats.pixel_error)
-            } else if self.seq_baselines[self.frame] > 0 {
-                self.seq_baselines[self.frame]
+            } else if self.seq_frames[self.frame].baseline > 0 {
+                self.seq_frames[self.frame].baseline
             } else {
                 stats.pixel_error
             };
@@ -719,7 +684,7 @@ impl C64App {
                     self.seq_running = false;
                 }
             } else {
-                let seq_count = self.seq_results.iter().filter(|r| r.is_some()).count();
+                let seq_count = self.seq_frames.iter().filter(|f| f.result.is_some()).count();
                 if seq_count > 0 {
                     stat_row(ui, "Optimized frames",
                         &format!("{}/{}", seq_count, data::TOTAL_FRAMES), COL_CHAR);
@@ -731,8 +696,7 @@ impl C64App {
                     }
                     if seq_count > 0 {
                         if ui.button("Clear all").clicked() {
-                            self.seq_results = vec![None; data::TOTAL_FRAMES];
-                            self.seq_baselines = vec![0; data::TOTAL_FRAMES];
+                            self.seq_frames = vec![SeqFrame::default(); data::TOTAL_FRAMES];
                             self.seq_total_saved = 0;
                         }
                     }

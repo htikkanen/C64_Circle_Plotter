@@ -335,6 +335,34 @@ fn build_geo_data() -> GeoData {
 static GEO: LazyLock<GeoData> = LazyLock::new(build_geo_data);
 
 // ---------------------------------------------------------------------------
+// Proximity pruning
+// ---------------------------------------------------------------------------
+
+/// Remove discs too close to a more important disc.
+/// Sorts by effective z (non-ghosts first, then by depth), keeps the first
+/// in each cluster, restores z-sort order.
+pub fn prune_by_proximity(positions: &mut Vec<DiscPosition>, threshold: f64) {
+    if threshold <= 0.0 { return; }
+    let threshold_sq = threshold * threshold;
+    positions.sort_by(|a, b| {
+        let za = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
+        let zb = if b.is_ghost { b.z + 10.0 + b.ghost_depth as f64 } else { b.z };
+        za.total_cmp(&zb)
+    });
+    let mut kept: Vec<DiscPosition> = Vec::with_capacity(positions.len());
+    for p in positions.iter() {
+        let dominated = kept.iter().any(|k| {
+            let dx = p.x - k.x;
+            let dy = p.y - k.y;
+            dx * dx + dy * dy < threshold_sq
+        });
+        if !dominated { kept.push(p.clone()); }
+    }
+    kept.sort_by(|a, b| a.z.total_cmp(&b.z));
+    *positions = kept;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
