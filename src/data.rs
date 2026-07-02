@@ -33,6 +33,11 @@ pub const FADE_CUTOFF: f64 = 0.85;
 /// Beat pulse period in frames (50 fps => 120 BPM).
 pub const BEAT_PERIOD: usize = 25;
 
+/// Per-frame sprite budget for the C64 mux (IRQ time, ~190 cycles/sprite).
+/// When a frame exceeds it, the deepest ghost tails are dropped first —
+/// applied identically by the exporter and the hw-true preview.
+pub const MAX_FRAME_SPRITES: usize = 32;
+
 pub struct SegmentDef {
     pub name: &'static str,
     pub len: usize,

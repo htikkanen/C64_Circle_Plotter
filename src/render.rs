@@ -439,12 +439,19 @@ pub fn render_frame(
         }
     };
 
+    // hw-true hides the ghost tails the exporter's sprite cap drops
+    let cap_dropped = if opts.hw_true {
+        capped_sprite_drops(&asgn, &sprite_slot_map)
+    } else {
+        vec![false; asgn.len()]
+    };
+
     // 4a. Render behind-chars sprites — background priority ($D01B=1)
     //     Mux IRQ sets $D01B per instance, so this is C64 compatible.
     if opts.show_sprites {
         for slot in (0..8u8).rev() {
             for (ai, a) in asgn.iter().enumerate() {
-                if a.mode != DiscMode::Sprite || !behind_sprite(a) { continue; }
+                if a.mode != DiscMode::Sprite || !behind_sprite(a) || cap_dropped[ai] { continue; }
                 if sprite_slot_map.get(ai).and_then(|s| *s) != Some(slot) { continue; }
                 let col = if opts.hw_true { C64_PALETTE[6] }
                     else { disc_color(a, glitch_color_active, glitch_frame) };
@@ -611,7 +618,7 @@ pub fn render_frame(
     if opts.show_sprites {
         for slot in (0..8u8).rev() {
             for (ai, a) in asgn.iter().enumerate() {
-                if a.mode != DiscMode::Sprite || behind_sprite(a) { continue; }
+                if a.mode != DiscMode::Sprite || behind_sprite(a) || cap_dropped[ai] { continue; }
                 if sprite_slot_map.get(ai).and_then(|s| *s) != Some(slot) { continue; }
                 if let Some(col) = sprite_col(a, ai) {
                     render_sprite(a, &col, false, &char_mask, &mut d);

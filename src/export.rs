@@ -65,8 +65,6 @@ pub fn build_export_data(
             (alloc.asgn, alloc.sprite_slot_map)
         };
 
-        let glitch_frame = fp.glitch_frame;
-
         // Collect char stamps with their 1-bit class color. `rank` orders the
         // streams: the rank-1 stream paints last and wins shared cells
         // (highlight over base; main discs over ghosts).
@@ -349,10 +347,15 @@ pub fn build_sprite_export_data(
 
         let mut sprites: Vec<(u16, u8, bool)> = Vec::new();
 
+        // Ghost sprites (trail tails) export too — the allocator reserved
+        // mux slots for them, and they carry the trail color (class 1,
+        // blue behind chars) now that trail chars are mono. Frames over the
+        // mux budget shed their deepest tails first.
+        let dropped = capped_sprite_drops(&asgn, &sprite_slot_map);
         for (ai, a) in asgn.iter().enumerate() {
             if a.mode != DiscMode::Sprite { continue; }
-            if a.is_ghost { continue; }
             if sprite_slot_map.get(ai).and_then(|s| *s).is_none() { continue; }
+            if dropped[ai] { continue; }
 
             let class1 = if is_spec {
                 specular_u(f, a.x, a.y, spec)
@@ -806,12 +809,13 @@ pub fn build_colram_plan(
 
 // ---------------------------------------------------------------------------
 // C64 memory budgets — must match prt_circleplotter.asm and spindle.txt:
-// stamps.bin at $5800, sprites.bin at $9000, playlist.bin at $cf00.
+// stamps.bin at $5800, sprites.bin at $9000, playlist.bin at $0400
+// (unused default screen RAM; VIC runs from the $4000 bank).
 // ---------------------------------------------------------------------------
 
 pub const STAMPS_BUDGET: usize = 0x9000 - 0x5800;   // 14336
-pub const SPRITES_BUDGET: usize = 0xcf00 - 0x9000;  // 16128
-pub const PLAYLIST_BUDGET: usize = 0xd000 - 0xcf00; // 256
+pub const SPRITES_BUDGET: usize = 0xd000 - 0x9000;  // 16384
+pub const PLAYLIST_BUDGET: usize = 0x0600 - 0x0400; // 512
 
 // ---------------------------------------------------------------------------
 // Top-level export functions

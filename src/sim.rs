@@ -861,6 +861,35 @@ pub fn gen_positions(f: usize) -> FramePositions {
 }
 
 // ---------------------------------------------------------------------------
+// Sprite cap
+// ---------------------------------------------------------------------------
+
+/// Ghost sprites dropped by the MAX_FRAME_SPRITES cap, per asgn index.
+/// Deepest (and among equals, back-most) tails go first; heads and the
+/// remaining tails keep their slots.
+pub fn capped_sprite_drops(asgn: &[Assignment], slot_map: &[Option<u8>]) -> Vec<bool> {
+    let mut dropped = vec![false; asgn.len()];
+    let is_live = |ai: usize| {
+        asgn[ai].mode == DiscMode::Sprite && slot_map.get(ai).and_then(|s| *s).is_some()
+    };
+    let count = (0..asgn.len()).filter(|&ai| is_live(ai)).count();
+    if count <= MAX_FRAME_SPRITES {
+        return dropped;
+    }
+    let mut ghosts: Vec<usize> = (0..asgn.len())
+        .filter(|&ai| is_live(ai) && asgn[ai].is_ghost)
+        .collect();
+    ghosts.sort_by(|&a, &b| {
+        asgn[b].ghost_depth.cmp(&asgn[a].ghost_depth)
+            .then(asgn[b].z.total_cmp(&asgn[a].z))
+    });
+    for ai in ghosts.into_iter().take(count - MAX_FRAME_SPRITES) {
+        dropped[ai] = true;
+    }
+    dropped
+}
+
+// ---------------------------------------------------------------------------
 // allocate
 // ---------------------------------------------------------------------------
 

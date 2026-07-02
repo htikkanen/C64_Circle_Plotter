@@ -1112,7 +1112,85 @@ fn headless_export() {
     }
 }
 
+/// Headless sequence optimization: run the stochastic optimizer over all
+/// frames (like the UI's "Optimize sequence"), then export with the results.
+fn headless_optimize(iters: u64) {
+    use std::sync::{Arc, Mutex};
+
+    let prune_dist = render::DisplayOpts::default().prune_dist;
+    let mut seq_frames = vec![SeqFrame::default(); data::TOTAL_FRAMES];
+    let mut total_saved: u64 = 0;
+    let mut total_demoted: u64 = 0;
+
+    for f in 0..data::TOTAL_FRAMES {
+        let positions = sim::gen_positions(f);
+        let mut vis: Vec<sim::DiscPosition> = positions.positions.iter()
+            .filter(|p| !sim::should_skip(p.z))
+            .cloned()
+            .collect();
+        sim::prune_by_proximity(&mut vis, prune_dist);
+
+        let alloc = sim::allocate(&vis);
+        let initial = optimizer::state_from_alloc(&alloc.asgn, &alloc.sprite_slot_map);
+
+        let baseline = {
+            let ideal = render::render_ideal(&vis, positions.glitch_color_active, positions.glitch_frame);
+            let actual = render::render_c64_image(&initial.asgn, &initial.sprite_slot_map,
+                positions.glitch_color_active, positions.glitch_frame);
+            render::pixel_error(&actual, &ideal)
+        };
+
+        let progress = Arc::new(Mutex::new(optimizer::OptProgress {
+            iterations_done: 0,
+            iterations_total: 0,
+            best_score: baseline,
+            baseline_score: baseline,
+            done: false,
+            best_state: None,
+            sprites_demoted: 0,
+        }));
+        optimizer::optimize_parallel(
+            vis,
+            initial,
+            positions.glitch_color_active,
+            positions.glitch_frame,
+            iters,
+            Arc::clone(&progress),
+        );
+
+        let p = progress.lock().unwrap();
+        total_saved += baseline.saturating_sub(p.best_score) as u64;
+        total_demoted += p.sprites_demoted as u64;
+        seq_frames[f].baseline = baseline;
+        if let Some(ref state) = p.best_state {
+            seq_frames[f].result = Some(state.clone());
+        }
+        if f % 25 == 0 {
+            eprintln!("  frame {}/{}: baseline {} best {} (saved total {}, demoted {})",
+                f, data::TOTAL_FRAMES, baseline, p.best_score, total_saved, total_demoted);
+        }
+    }
+
+    eprintln!("=== Sequence optimization done: {} px saved, {} sprites demoted ===",
+        total_saved, total_demoted);
+
+    let spec = data::SpecularParams::default();
+    let repeats: Vec<u16> = data::SEGMENTS.iter().map(|s| s.default_repeats).collect();
+    let (st_bin, _) = export::export_stamps(prune_dist, &seq_frames, &spec);
+    let (sp_bin, _) = export::export_sprites(prune_dist, &seq_frames, &spec);
+    let (pl_bin, _) = export::export_playlist(&repeats);
+    eprintln!("  stamps.bin {} B / {} | sprites.bin {} B / {} | playlist.bin {} B",
+        st_bin, export::STAMPS_BUDGET, sp_bin, export::SPRITES_BUDGET, pl_bin);
+}
+
 fn main() -> eframe::Result<()> {
+    if let Some(arg) = std::env::args().find(|a| a.starts_with("--optimize")) {
+        let iters = arg.strip_prefix("--optimize=")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+        headless_optimize(iters);
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--export") {
         headless_export();
         return Ok(());
