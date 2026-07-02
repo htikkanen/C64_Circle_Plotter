@@ -72,7 +72,6 @@ const CX: f64 = 157.0;
 const CY: f64 = 98.0;
 const GEO_R: f64 = 85.0;
 const GEO_DIST: f64 = 400.0;
-const F_END: f64 = 256.0;
 
 // ---------------------------------------------------------------------------
 // FONT definition
@@ -432,19 +431,24 @@ pub fn gen_positions(f: usize) -> FramePositions {
     let ff = f as f64;
 
     const TRAIL_LIFE: f64 = 12.0;
-    const EXIT_FRAMES: f64 = 48.0;
 
     let e_range = &geo.letter_ranges[0];
-    let morph_frames = ((P3_END - P2_END) as f64 * 0.2).floor() as usize;
 
-    let morph_t = if f >= P2_END && f < P2_END + morph_frames {
-        let mf = (f - P2_END) as f64;
-        let t = mf / morph_frames as f64;
-        smoothstep(t)
-    } else if f >= P2_END + morph_frames {
-        1.0
-    } else {
+    // Segment mapping
+    let (seg, seg_local) = segment_at(f);
+    let seg_t = seg_local as f64 / SEGMENTS[seg].len as f64; // 0..1 within segment
+
+    let intro_len = SEGMENTS[SEG_INTRO].len;
+    let morph_start = segment_start(SEG_MORPH);
+    let exit_frames = SEGMENTS[SEG_EXIT].len as f64;
+
+    // Morph from vertical to horizontal layout happens during SEG_MORPH.
+    let morph_t = if seg < SEG_MORPH {
         0.0
+    } else if seg == SEG_MORPH {
+        smoothstep(seg_t)
+    } else {
+        1.0
     };
 
     let e_vert_y = geo.e_vert_y;
@@ -452,56 +456,62 @@ pub fn gen_positions(f: usize) -> FramePositions {
     let e_vert_x = geo.e_vert_x;
     let d_vert_x = geo.d_vert_x;
 
-    // Camera parameters
+    // Camera parameters — each segment starts where the previous one ended;
+    // loop segments hold the camera still so any repeat count is seamless.
     let zoom_factor: f64;
     let pan_y: f64;
     let mut pan_x: f64 = 0.0;
     let stretch_x: f64 = 1.0;
 
-    if f < P1_END {
-        let t = ff / P1_END as f64;
-        let e = smoothstep(t);
-        zoom_factor = 2.5 + (1.8 - 2.5) * e;
-        pan_y = -e_vert_y * GEO_R * zoom_factor;
-    } else if f < P2_END {
-        let t = (ff - P1_END as f64) / (P2_END - P1_END) as f64;
-        let e = smoothstep(t);
-        zoom_factor = 1.8 + (3.0 - 1.8) * e;
-        let start_pan_y = -e_vert_y * GEO_R * 1.8;
-        let end_pan_y = -d_vert_y * GEO_R * 3.0;
-        pan_y = start_pan_y + (end_pan_y - start_pan_y) * e;
-    } else {
-        zoom_factor = 3.0;
-        let cur_r15 = GEO_R * 3.0;
-        if f < P3_END {
-            let t = (ff - P2_END as f64) / (P3_END - P2_END) as f64;
-            let settle_end = 0.2;
-            if t < settle_end {
-                let st = t / settle_end;
-                let se = smoothstep(st);
-                pan_y = (-d_vert_y * cur_r15) * (1.0 - se);
-                pan_x = (-e_vert_x * cur_r15) * se;
-            } else {
-                let pt = (t - settle_end) / (1.0 - settle_end);
-                pan_y = 0.0;
-                let e_pan_x = -e_vert_x * cur_r15;
-                let d_pan_x = -d_vert_x * cur_r15;
-                pan_x = e_pan_x + (d_pan_x - e_pan_x) * pt;
-            }
-        } else {
+    let cur_r15 = GEO_R * 3.0;
+    match seg {
+        SEG_INTRO => {
+            let e = smoothstep(seg_t);
+            zoom_factor = 2.5 + (1.8 - 2.5) * e;
+            pan_y = -e_vert_y * GEO_R * zoom_factor;
+        }
+        SEG_XTEND => {
+            let e = smoothstep(seg_t);
+            zoom_factor = 1.8 + (3.0 - 1.8) * e;
+            let start_pan_y = -e_vert_y * GEO_R * 1.8;
+            let end_pan_y = -d_vert_y * GEO_R * 3.0;
+            pan_y = start_pan_y + (end_pan_y - start_pan_y) * e;
+        }
+        SEG_MORPH => {
+            zoom_factor = 3.0;
+            let se = smoothstep(seg_t);
+            pan_y = (-d_vert_y * cur_r15) * (1.0 - se);
+            pan_x = (-e_vert_x * cur_r15) * se;
+        }
+        SEG_HOLD_E => {
+            zoom_factor = 3.0;
+            pan_y = 0.0;
+            pan_x = -e_vert_x * cur_r15;
+        }
+        SEG_PAN => {
+            zoom_factor = 3.0;
+            pan_y = 0.0;
+            // Eased so pan velocity is ~0 at both ends (joins static holds).
+            let pt = smoothstep(seg_t);
+            let e_pan_x = -e_vert_x * cur_r15;
+            let d_pan_x = -d_vert_x * cur_r15;
+            pan_x = e_pan_x + (d_pan_x - e_pan_x) * pt;
+        }
+        _ => {
+            // SEG_HOLD_D, SEG_EXIT
+            zoom_factor = 3.0;
             pan_y = 0.0;
             pan_x = -d_vert_x * cur_r15;
         }
     }
 
-    // Rotation angles
-    let p = if f < P2_END {
-        0.0
-    } else if f < P3_END {
-        (ff - P2_END as f64) / F_END
-    } else {
-        (P3_END as f64 - P2_END as f64) / F_END
-            + ((ff - P3_END as f64) / EXIT_FRAMES) * 0.5
+    // Rotation wobble phase — angles are sin(p*2π)*amp, so a segment where p
+    // advances 0..1 starts and ends at zero angle moving in the same
+    // direction. Holds complete one full cycle per pass => seamless wrap.
+    let p = match seg {
+        SEG_HOLD_E | SEG_PAN | SEG_HOLD_D => seg_t,
+        SEG_EXIT => seg_t * 0.5,
+        _ => 0.0,
     };
 
     let ax = (p * 2.0 * std::f64::consts::PI).sin() * 0.18;
@@ -509,7 +519,7 @@ pub fn gen_positions(f: usize) -> FramePositions {
     let az = (p * 2.0 * std::f64::consts::PI).sin() * 0.04;
 
     // Beat pulse
-    let bpm_period: f64 = 25.0;
+    let bpm_period: f64 = BEAT_PERIOD as f64;
     let beat_phase = (ff % bpm_period) / bpm_period;
     let pulse_amt = if beat_phase < 0.05 {
         beat_phase / 0.05
@@ -532,7 +542,7 @@ pub fn gen_positions(f: usize) -> FramePositions {
 
     let mut shake_x: f64 = 0.0;
     let mut shake_y: f64 = 0.0;
-    if f >= P2_END {
+    if f >= morph_start {
         let shake_amt = pulse_amt * 6.0;
         shake_x = shake_amt * (ff * 7.3).sin();
         shake_y = shake_amt * (ff * 11.1).cos();
@@ -585,17 +595,17 @@ pub fn gen_positions(f: usize) -> FramePositions {
         if i < e_range.end {
             let local_idx = i - e_range.start;
             let local_count = e_range.end - e_range.start;
-            return ((local_idx as f64 / local_count as f64) * P1_END as f64 * 0.7).floor()
+            return ((local_idx as f64 / local_count as f64) * intro_len as f64 * 0.7).floor()
                 as usize;
         }
         for li in 1..geo.letter_ranges.len() {
             let lr = &geo.letter_ranges[li];
             if i >= lr.start && i < lr.end {
                 let frames_per_letter =
-                    ((P2_END - P1_END) as f64 / 5.0).floor() as usize;
+                    (SEGMENTS[SEG_XTEND].len as f64 / 5.0).floor() as usize;
                 let local_idx = i - lr.start;
                 let local_count = lr.end - lr.start;
-                return P1_END
+                return intro_len
                     + (li - 1) * frames_per_letter
                     + ((local_idx as f64 / local_count as f64) * frames_per_letter as f64)
                         .floor() as usize;
@@ -604,12 +614,8 @@ pub fn gen_positions(f: usize) -> FramePositions {
         0
     };
 
-    let is_exit = f >= P3_END && f < P4_END;
-    let exit_t = if is_exit {
-        (ff - P3_END as f64) / EXIT_FRAMES
-    } else {
-        0.0
-    };
+    let is_exit = seg == SEG_EXIT;
+    let exit_t = if is_exit { seg_t } else { 0.0 };
     let exit_life: f64 = 14.0;
 
     let exit_delay = |i: usize| -> f64 {
@@ -630,17 +636,16 @@ pub fn gen_positions(f: usize) -> FramePositions {
             return 0.0;
         }
         let delay = exit_delay(i);
-        ((exit_t - delay) / (exit_life / EXIT_FRAMES))
+        ((exit_t - delay) / (exit_life / exit_frames))
             .max(0.0)
             .min(1.0)
     };
 
     // E-letter scale (sized for the larger 21px circle)
-    let e_scale: f64 = if f < P1_END {
+    let e_scale: f64 = if seg == SEG_INTRO {
         2.0
-    } else if f < P2_END {
-        let t = (ff - P1_END as f64) / (P2_END - P1_END) as f64;
-        let e = smoothstep(t);
+    } else if seg == SEG_XTEND {
+        let e = smoothstep(seg_t);
         2.0 + (1.0 - 2.0) * e
     } else {
         1.0
@@ -648,7 +653,7 @@ pub fn gen_positions(f: usize) -> FramePositions {
 
     let mut result: Vec<DiscPosition> = Vec::with_capacity(geo.n_verts * 3);
 
-    if f < P4_END {
+    if f < TOTAL_FRAMES {
         for i in 0..geo.n_verts {
             let birth = disc_birth(i);
             if !is_exit && f < birth {
@@ -677,8 +682,8 @@ pub fn gen_positions(f: usize) -> FramePositions {
 
             let (fin_x, fin_y, fin_z) = project(vs_x, vs_y, vs_z);
 
-            // Phase 1 & 2: trail fly-in
-            if f < P2_END {
+            // Intro/xtend: trail fly-in
+            if f < morph_start {
                 let age = f as i64 - birth as i64;
                 if age < 0 {
                     continue;
@@ -1265,5 +1270,85 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
         mux_used,
         conflicts: char_conflicts,
         sprite_slot_map,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loop seam tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    type PosMap = HashMap<(usize, bool, u8), (f64, f64)>;
+
+    fn pos_map(f: usize) -> PosMap {
+        gen_positions(f)
+            .positions
+            .into_iter()
+            .map(|p| ((p.id, p.is_ghost, p.ghost_depth), (p.x, p.y)))
+            .collect()
+    }
+
+    /// Max distance moved by any disc present in both frames.
+    fn max_step(a: &PosMap, b: &PosMap) -> f64 {
+        a.iter()
+            .filter_map(|(k, &(x0, y0))| {
+                b.get(k)
+                    .map(|&(x1, y1)| ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt())
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn loop_segments_wrap_seamlessly() {
+        for (si, segdef) in SEGMENTS.iter().enumerate() {
+            if !segdef.loops {
+                continue;
+            }
+            let s = segment_start(si);
+            let frames: Vec<PosMap> = (s..s + segdef.len).map(pos_map).collect();
+
+            // Same disc set at both ends of the wrap
+            let first: HashSet<_> = frames[0].keys().cloned().collect();
+            let last: HashSet<_> = frames[segdef.len - 1].keys().cloned().collect();
+            assert_eq!(first, last, "'{}': disc set changes across wrap", segdef.name);
+
+            // The wrap step must look like any ordinary in-loop step
+            let typical = frames
+                .windows(2)
+                .map(|w| max_step(&w[0], &w[1]))
+                .fold(0.0, f64::max);
+            let wrap = max_step(&frames[segdef.len - 1], &frames[0]);
+            assert!(
+                wrap <= typical && wrap <= 2.5,
+                "'{}': wrap step {:.2}px (max in-loop step {:.2}px)",
+                segdef.name, wrap, typical
+            );
+        }
+    }
+
+    #[test]
+    fn segment_joins_are_smooth() {
+        // Joins from the first hold onward connect static-camera segments;
+        // the presented sequence must not jump at the boundary.
+        for si in SEG_HOLD_E..SEGMENTS.len() {
+            let b = segment_start(si);
+            let near: Vec<PosMap> = (b - 5..b + 5).map(pos_map).collect();
+            let neighborhood = near
+                .windows(2)
+                .enumerate()
+                .filter(|(i, _)| *i != 4)
+                .map(|(_, w)| max_step(&w[0], &w[1]))
+                .fold(0.0, f64::max);
+            let join = max_step(&near[4], &near[5]);
+            assert!(
+                join <= neighborhood * 1.5 + 0.75,
+                "join into '{}': step {:.2}px (neighborhood max {:.2}px)",
+                SEGMENTS[si].name, join, neighborhood
+            );
+        }
     }
 }

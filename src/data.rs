@@ -16,15 +16,90 @@ pub const MUX_H: usize = 22;
 pub const MAX_SPR_LINE: usize = 8;
 pub const FPS: f64 = 50.0;
 pub const EMPTY_IDX: u16 = 0;
-pub const TOTAL_FRAMES: usize = 304;
 
 pub const FADE_CUTOFF: f64 = 0.85;
 
-// Animation phase boundaries
-pub const P1_END: usize = 64;
-pub const P2_END: usize = 128;
-pub const P3_END: usize = 256;
-pub const P4_END: usize = 304;
+// ---------------------------------------------------------------------------
+// Animation segments
+// ---------------------------------------------------------------------------
+// The presentation is built from segments so the C64 player can repeat the
+// loopable ones (playlist export) — presentation time scales without frame
+// data growth. Loop segments are generated to be seamless:
+//   - length is a multiple of BEAT_PERIOD, so the beat pulse phase repeats,
+//   - they start at frame % BEAT_PERIOD == 13, placing the wrap point in the
+//     pulse dead zone (pulse_amt == 0, so shake is also zero across the wrap),
+//   - the rotation wobble completes exactly one full sine cycle per pass.
+
+/// Beat pulse period in frames (50 fps => 120 BPM).
+pub const BEAT_PERIOD: usize = 25;
+
+pub struct SegmentDef {
+    pub name: &'static str,
+    pub len: usize,
+    pub loops: bool,
+    pub default_repeats: u16,
+}
+
+pub const SEG_INTRO: usize = 0;
+pub const SEG_XTEND: usize = 1;
+pub const SEG_MORPH: usize = 2;
+pub const SEG_HOLD_E: usize = 3;
+pub const SEG_PAN: usize = 4;
+pub const SEG_HOLD_D: usize = 5;
+pub const SEG_EXIT: usize = 6;
+
+// Segment lengths are chosen so every boundary from "morph" onward lands on
+// frame % 25 == 13 (see above). Changing a length shifts all later segments —
+// keep loop boundaries in the dead zone.
+pub const SEGMENTS: [SegmentDef; 7] = [
+    SegmentDef { name: "intro",  len: 64,  loops: false, default_repeats: 1 },
+    SegmentDef { name: "xtend",  len: 64,  loops: false, default_repeats: 1 },
+    SegmentDef { name: "morph",  len: 35,  loops: false, default_repeats: 1 },
+    SegmentDef { name: "hold E", len: 75,  loops: true,  default_repeats: 4 },
+    SegmentDef { name: "pan",    len: 100, loops: false, default_repeats: 1 },
+    SegmentDef { name: "hold D", len: 75,  loops: true,  default_repeats: 6 },
+    SegmentDef { name: "exit",   len: 48,  loops: false, default_repeats: 1 },
+];
+
+/// First frame of segment `idx` (== total frames when idx == SEGMENTS.len()).
+pub const fn segment_start(idx: usize) -> usize {
+    let mut s = 0;
+    let mut i = 0;
+    while i < idx {
+        s += SEGMENTS[i].len;
+        i += 1;
+    }
+    s
+}
+
+/// Unique frames of animation data (the presentation is longer via loops).
+pub const TOTAL_FRAMES: usize = segment_start(SEGMENTS.len());
+
+/// Map a data frame index to (segment index, segment-local frame).
+pub fn segment_at(f: usize) -> (usize, usize) {
+    let mut start = 0;
+    for (i, seg) in SEGMENTS.iter().enumerate() {
+        if f < start + seg.len {
+            return (i, f - start);
+        }
+        start += seg.len;
+    }
+    (SEGMENTS.len() - 1, SEGMENTS[SEGMENTS.len() - 1].len - 1)
+}
+
+// Loop boundaries must sit in the beat-pulse dead zone (frame % 25 in 13..24)
+// so the wrap carries no pulse/shake discontinuity.
+const _: () = {
+    let mut i = 0;
+    while i < SEGMENTS.len() {
+        if SEGMENTS[i].loops {
+            assert!(SEGMENTS[i].len % BEAT_PERIOD == 0, "loop length must be a multiple of BEAT_PERIOD");
+            let s = segment_start(i) % BEAT_PERIOD;
+            assert!(s >= 13, "loop segment must start in the pulse dead zone");
+        }
+        i += 1;
+    }
+};
 
 /// 514 characters, each 8 bytes (8x8 bitmap).
 pub static CHARSET: [[u8; 8]; 514] = [

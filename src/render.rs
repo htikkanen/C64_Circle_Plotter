@@ -42,6 +42,7 @@ pub struct DisplayOpts {
     pub error_overlay: bool,
     pub ideal_render: bool,
     pub mux_overlay: bool,
+    pub compute_error: bool,
 }
 
 impl Default for DisplayOpts {
@@ -58,6 +59,7 @@ impl Default for DisplayOpts {
             error_overlay: false,
             ideal_render: false,
             mux_overlay: false,
+            compute_error: false,
         }
     }
 }
@@ -128,6 +130,27 @@ pub fn disc_color(a: &Assignment, glitch_color_active: bool, glitch_frame: usize
     };
 
     SHADE_RAMP[base_idx.min(SHADE_RAMP.len() - 1)]
+}
+
+/// Return the shade ramp index (0-6) for a disc. Same logic as disc_color but returns the index.
+pub fn shade_index(a: &Assignment, glitch_color_active: bool, glitch_frame: usize) -> usize {
+    if glitch_color_active {
+        let gr = ((a.id as u64).wrapping_mul(53).wrapping_add((glitch_frame as u64).wrapping_mul(31))
+            & 0x7fff_ffff) % 100;
+        if gr < 15 {
+            let wrong_idx = ((a.id as u64).wrapping_mul(97).wrapping_add((glitch_frame as u64).wrapping_mul(13))
+                & 0x7fff_ffff) % (SHADE_RAMP.len() as u64);
+            return wrong_idx as usize;
+        }
+    }
+    let base_idx: usize = if a.is_ghost {
+        let d = if a.ghost_depth == 0 { 1 } else { a.ghost_depth };
+        if d <= 1 { 2 } else if d <= 2 { 1 } else { 0 }
+    } else {
+        let z = a.z;
+        if z <= -0.3 { 5 } else if z <= -0.1 { 4 } else if z <= 0.1 { 3 } else if z <= 0.3 { 2 } else { 1 }
+    };
+    base_idx.min(SHADE_RAMP.len() - 1)
 }
 
 // ============================================================
@@ -653,7 +676,7 @@ pub fn render_frame(
     }
 
     // Compute pixel error only when needed (error overlay already computed ideal above)
-    let pe = if opts.error_overlay || opts.ideal_render {
+    let pe = if opts.error_overlay || opts.ideal_render || opts.compute_error {
         // Ideal was already rendered in step 8 — reuse the comparison
         let c64_rgb = render_c64_image(&asgn, &sprite_slot_map, glitch_color_active, glitch_frame);
         let ideal = render_ideal(&vis_positions, glitch_color_active, glitch_frame);

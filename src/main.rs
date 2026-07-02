@@ -2,6 +2,7 @@ mod data;
 mod sim;
 mod render;
 mod optimizer;
+mod export;
 
 use std::sync::{Arc, Mutex};
 use eframe::egui;
@@ -10,9 +11,9 @@ use eframe::egui;
 // App state
 // ---------------------------------------------------------------------------
 #[derive(Clone, Default)]
-struct SeqFrame {
-    result: Option<optimizer::OptState>,
-    baseline: u32,
+pub struct SeqFrame {
+    pub result: Option<optimizer::OptState>,
+    pub baseline: u32,
 }
 
 struct C64App {
@@ -42,6 +43,28 @@ struct C64App {
     seq_running: bool,
     seq_current_frame: usize,
     seq_total_saved: u32,
+    export_status: Option<String>,
+
+    // Segment playlist (loop repeats for presentation preview + export)
+    seg_repeats: Vec<u16>,
+    loop_preview: bool,
+    pres_frame: usize,     // index into pres_map when loop_preview is on
+    pres_map: Vec<u32>,    // presentation frame -> data frame
+}
+
+/// Expand the segment playlist into a presentation -> data frame map.
+fn build_pres_map(repeats: &[u16]) -> Vec<u32> {
+    let mut map = Vec::new();
+    for (i, seg) in data::SEGMENTS.iter().enumerate() {
+        let start = data::segment_start(i);
+        let reps = if seg.loops { repeats[i].max(1) as usize } else { 1 };
+        for _ in 0..reps {
+            for l in 0..seg.len {
+                map.push((start + l) as u32);
+            }
+        }
+    }
+    map
 }
 
 impl C64App {
@@ -72,18 +95,41 @@ impl C64App {
             seq_running: false,
             seq_current_frame: 0,
             seq_total_saved: 0,
+            export_status: None,
+            seg_repeats: data::SEGMENTS.iter().map(|s| s.default_repeats).collect(),
+            loop_preview: true,
+            pres_frame: 0,
+            pres_map: build_pres_map(
+                &data::SEGMENTS.iter().map(|s| s.default_repeats).collect::<Vec<_>>()),
         }
     }
 
     fn advance_frame(&mut self) {
-        self.frame += 1;
-        if self.frame >= data::TOTAL_FRAMES {
-            self.frame = 0;
+        if self.loop_preview {
+            self.pres_frame += 1;
+            if self.pres_frame >= self.pres_map.len() {
+                self.pres_frame = 0;
+            }
+            self.frame = self.pres_map[self.pres_frame] as usize;
+        } else {
+            self.frame += 1;
+            if self.frame >= data::TOTAL_FRAMES {
+                self.frame = 0;
+            }
         }
+    }
+
+    /// Point the presentation cursor at the first occurrence of the current
+    /// data frame (after scrubbing or stepping).
+    fn sync_pres_to_frame(&mut self) {
+        self.pres_frame = self.pres_map.iter()
+            .position(|&d| d as usize == self.frame)
+            .unwrap_or(0);
     }
 
     fn reset(&mut self) {
         self.frame = 0;
+        self.pres_frame = 0;
         self.playing = false;
         self.corrupt_total = 0;
         self.last_corrupt_frame = None;
@@ -101,6 +147,9 @@ impl C64App {
         }
 
         let positions = sim::gen_positions(self.frame);
+
+        // Compute pixel error when paused (optimizer panel needs it)
+        self.opts.compute_error = !self.playing;
 
         // Use optimized allocation if available for this frame
         let opt_override = self.get_opt_override();
@@ -260,13 +309,14 @@ impl C64App {
 // ---------------------------------------------------------------------------
 // Color constants
 // ---------------------------------------------------------------------------
-/// Phase metadata: (start_frame, end_frame, color, label)
-const PHASES: [(usize, usize, egui::Color32, &str); 4] = [
-    (0, data::P1_END, egui::Color32::from_rgb(0x44, 0x33, 0x55), "E zooms in"),
-    (data::P1_END, data::P2_END, egui::Color32::from_rgb(0x33, 0x55, 0x44), "XTEND appears"),
-    (data::P2_END, data::P3_END, egui::Color32::from_rgb(0x33, 0x44, 0x55), "E->D pan"),
-    (data::P3_END, data::P4_END, egui::Color32::from_rgb(0x55, 0x33, 0x44), "exit"),
+/// Timeline colors, cycled per segment (loop segments get the warm ones).
+const SEG_COLORS: [egui::Color32; 4] = [
+    egui::Color32::from_rgb(0x44, 0x33, 0x55),
+    egui::Color32::from_rgb(0x33, 0x55, 0x44),
+    egui::Color32::from_rgb(0x33, 0x44, 0x55),
+    egui::Color32::from_rgb(0x2d, 0x3a, 0x4f),
 ];
+const SEG_LOOP_COLOR: egui::Color32 = egui::Color32::from_rgb(0x5a, 0x42, 0x2e);
 
 // Theme colors
 const COL_BG: egui::Color32 = egui::Color32::from_rgb(0x0a, 0x0a, 0x0e);
@@ -448,6 +498,7 @@ impl C64App {
                 } else {
                     self.frame -= 1;
                 }
+                self.sync_pres_to_frame();
             }
             if ui.button(">").clicked() {
                 self.playing = false;
@@ -472,10 +523,17 @@ impl C64App {
 
             ui.add_space(10.0);
 
-            // Frame counter
+            // Frame counter (data frame + presentation position when looping)
+            let counter = if self.loop_preview {
+                format!("Frame {} / {}  ·  Show {} / {}",
+                    self.frame, data::TOTAL_FRAMES,
+                    self.pres_frame, self.pres_map.len())
+            } else {
+                format!("Frame {} / {}", self.frame, data::TOTAL_FRAMES)
+            };
             ui.colored_label(
                 COL_ACCENT,
-                egui::RichText::new(format!("Frame {} / {}", self.frame, data::TOTAL_FRAMES))
+                egui::RichText::new(counter)
                     .size(12.0)
                     .strong(),
             );
@@ -503,17 +561,25 @@ impl C64App {
         let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::click_and_drag());
         let rect = response.rect;
 
-        // Phase segments
-        for &(s, e, color, label) in &PHASES {
+        // Segments (loop segments highlighted, labeled with repeat count)
+        for (i, seg) in data::SEGMENTS.iter().enumerate() {
+            let s = data::segment_start(i);
+            let e = s + seg.len;
             let x0 = rect.left() + (s as f32 / data::TOTAL_FRAMES as f32) * rect.width();
             let x1 = rect.left() + (e as f32 / data::TOTAL_FRAMES as f32) * rect.width();
-            let phase_rect = egui::Rect::from_min_max(
+            let seg_rect = egui::Rect::from_min_max(
                 egui::pos2(x0, rect.top()),
                 egui::pos2(x1, rect.bottom()),
             );
-            painter.rect_filled(phase_rect, 0.0, color);
+            let color = if seg.loops { SEG_LOOP_COLOR } else { SEG_COLORS[i % SEG_COLORS.len()] };
+            painter.rect_filled(seg_rect, 0.0, color);
+            let label = if seg.loops {
+                format!("{} x{}", seg.name, self.seg_repeats[i].max(1))
+            } else {
+                seg.name.to_string()
+            };
             painter.text(
-                phase_rect.center(),
+                seg_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 label,
                 egui::FontId::monospace(8.0),
@@ -541,6 +607,7 @@ impl C64App {
                 if new_frame != self.frame {
                     self.frame = new_frame;
                     self.playing = false;
+                    self.sync_pres_to_frame();
                 }
             }
         }
@@ -595,6 +662,47 @@ impl C64App {
                 &format!("{} B ({:.1} KB)", self.accum_mem_bytes, kb),
                 COL_TEXT,
             );
+        });
+
+        // -- Segments / playlist --
+        draw_panel(ui, "SEGMENTS", |ui| {
+            let mut repeats_changed = false;
+            for (i, seg) in data::SEGMENTS.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let marker = if seg.loops { "⟳" } else { " " };
+                    ui.colored_label(
+                        if seg.loops { COL_WARN } else { COL_DIM },
+                        egui::RichText::new(format!("{} {}", marker, seg.name)).size(11.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if seg.loops {
+                            let dv = egui::DragValue::new(&mut self.seg_repeats[i])
+                                .range(1..=255)
+                                .prefix("x");
+                            repeats_changed |= ui.add(dv).changed();
+                        } else {
+                            ui.colored_label(COL_DIM, egui::RichText::new("x1").size(11.0));
+                        }
+                        ui.colored_label(COL_DIM,
+                            egui::RichText::new(format!("{} fr", seg.len)).size(11.0));
+                    });
+                });
+            }
+            if repeats_changed {
+                self.pres_map = build_pres_map(&self.seg_repeats);
+                self.sync_pres_to_frame();
+            }
+
+            ui.separator();
+            let pres_len = self.pres_map.len();
+            stat_row(ui, "Data frames", &data::TOTAL_FRAMES.to_string(), COL_TEXT);
+            stat_row(ui, "Show frames",
+                &format!("{} ({:.1}s)", pres_len, pres_len as f64 / data::FPS), COL_ACCENT);
+
+            let mut lp = self.loop_preview;
+            if ui.checkbox(&mut lp, egui::RichText::new("Loop preview (play repeats)").size(10.0)).changed() {
+                self.loop_preview = lp;
+                self.sync_pres_to_frame();
+            }
         });
 
         // -- Optimizer --
@@ -702,6 +810,38 @@ impl C64App {
                     }
                 });
             }
+
+            ui.separator();
+
+            // Export
+            if ui.button("Export all").clicked() {
+                let (st_bin, _st_txt) = export::export_stamps(
+                    self.opts.prune_dist,
+                    &self.seq_frames,
+                );
+                let (sp_bin, _sp_txt) = export::export_sprites(
+                    self.opts.prune_dist,
+                    &self.seq_frames,
+                );
+                let (pl_bin, _pl_txt) = export::export_playlist(&self.seg_repeats);
+                let budget = |used: usize, avail: usize| -> String {
+                    if used <= avail {
+                        format!("{} / {} B", used, avail)
+                    } else {
+                        format!("{} / {} B OVER BUDGET!", used, avail)
+                    }
+                };
+                self.export_status = Some(format!(
+                    "stamps.bin {}\nsprites.bin {}\nplaylist.bin {}",
+                    budget(st_bin, export::STAMPS_BUDGET),
+                    budget(sp_bin, export::SPRITES_BUDGET),
+                    budget(pl_bin, export::PLAYLIST_BUDGET)));
+            }
+            if let Some(ref status) = self.export_status {
+                let over = status.contains("OVER");
+                ui.colored_label(if over { COL_WARN } else { COL_CHAR },
+                    egui::RichText::new(status).size(9.0));
+            }
         });
     }
 
@@ -762,18 +902,48 @@ fn option_toggle_compact(ui: &mut egui::Ui, label: &str, value: &mut bool) {
 }
 
 fn phase_label(frame: usize) -> &'static str {
-    for &(s, e, _, label) in &PHASES {
-        if frame >= s && frame < e {
-            return label;
-        }
-    }
-    "--"
+    let (seg, _) = data::segment_at(frame);
+    data::SEGMENTS[seg].name
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
+/// Headless export: default allocation (no stochastic optimization), default
+/// repeats. Writes stamps/sprites/playlist .bin/.txt into the current dir.
+fn headless_export() {
+    let seq_frames = vec![SeqFrame::default(); data::TOTAL_FRAMES];
+    let prune_dist = render::DisplayOpts::default().prune_dist;
+    let repeats: Vec<u16> = data::SEGMENTS.iter().map(|s| s.default_repeats).collect();
+
+    let (st_bin, _) = export::export_stamps(prune_dist, &seq_frames);
+    let (sp_bin, _) = export::export_sprites(prune_dist, &seq_frames);
+    let (pl_bin, _) = export::export_playlist(&repeats);
+
+    let report = |name: &str, used: usize, avail: usize| {
+        eprintln!("  {:<13} {:>6} B / {:>6} B budget{}",
+            name, used, avail, if used > avail { "  *** OVER BUDGET ***" } else { "" });
+    };
+    eprintln!("=== Headless export (default allocation, prune={:.1}) ===", prune_dist);
+    report("stamps.bin", st_bin, export::STAMPS_BUDGET);
+    report("sprites.bin", sp_bin, export::SPRITES_BUDGET);
+    report("playlist.bin", pl_bin, export::PLAYLIST_BUDGET);
+    let pres: usize = data::SEGMENTS.iter().enumerate()
+        .map(|(i, s)| s.len * if s.loops { repeats[i].max(1) as usize } else { 1 })
+        .sum();
+    eprintln!("  {} data frames, {} presented frames ({:.1}s at 50fps)",
+        data::TOTAL_FRAMES, pres, pres as f64 / data::FPS);
+    eprintln!();
+    export::analyze_memory(prune_dist, &seq_frames);
+}
+
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == "--export") {
+        headless_export();
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 700.0])
