@@ -333,6 +333,40 @@ fn build_geo_data() -> GeoData {
 
 static GEO: LazyLock<GeoData> = LazyLock::new(build_geo_data);
 
+/// Environment sampling coordinate ("simple 2D envmap") for a disc at
+/// screen position (x, y) on frame `f`, or None in trail segments.
+///
+/// The logo is a flat plane, so the camera-space normal alone is constant
+/// across it — the spatial variation of the reflection comes from the
+/// per-point view direction. u approximates the reflected ray elevation:
+/// view pitch (normalized screen y, `slant` mixes in a little yaw) plus the
+/// rocking surface tilt (sin of the wobble phase — periodic per loop pass,
+/// so wraps are seamless; morph holds p=0, joining hold E continuously).
+/// Screen coordinates already include pan/zoom/beat-pulse/barrel distortion,
+/// so the reflection is inherently camera-synced.
+pub fn specular_u(f: usize, x: f64, y: f64, spec: &SpecularParams) -> Option<f64> {
+    let (seg, sl) = segment_at(f);
+    if !segment_is_specular(seg) {
+        return None;
+    }
+    let p = match seg {
+        SEG_HOLD_E | SEG_PAN | SEG_HOLD_D => sl as f64 / SEGMENTS[seg].len as f64,
+        _ => 0.0, // SEG_MORPH
+    };
+    let u_view = (y - CY) / C64H as f64 + spec.slant * ((x - CX) / C64H as f64);
+    let u_tilt = spec.sweep * (p * 2.0 * std::f64::consts::PI).sin();
+    Some(u_view + u_tilt)
+}
+
+/// Environment profile: is `u` inside a lit stripe? Stripes repeat every
+/// `period`; with period well above the visible span (~0.5 per letter
+/// height) this reads as a single non-tiling stripe that rocks in and out
+/// with the wobble instead of wrapping bottom-to-top.
+pub fn specular_lit(u: f64, spec: &SpecularParams) -> bool {
+    let m = u.rem_euclid(spec.period);
+    m.min(spec.period - m) < spec.width
+}
+
 // ---------------------------------------------------------------------------
 // Proximity pruning
 // ---------------------------------------------------------------------------
@@ -1325,6 +1359,43 @@ mod tests {
             assert!(
                 wrap <= typical && wrap <= 2.5,
                 "'{}': wrap step {:.2}px (max in-loop step {:.2}px)",
+                segdef.name, wrap, typical
+            );
+        }
+    }
+
+    #[test]
+    fn specular_stripes_are_loop_continuous() {
+        let spec = SpecularParams::default();
+        // Lit classification per disc id, from real screen positions
+        let lit_set = |f: usize| -> HashMap<usize, bool> {
+            gen_positions(f).positions.iter()
+                .filter(|p| !p.is_ghost)
+                .map(|p| {
+                    let lit = specular_u(f, p.x, p.y, &spec)
+                        .map(|u| specular_lit(u, &spec))
+                        .unwrap_or(false);
+                    (p.id, lit)
+                })
+                .collect()
+        };
+        let diff = |a: &HashMap<usize, bool>, b: &HashMap<usize, bool>| -> usize {
+            a.iter().filter(|(id, l)| b.get(id).map_or(false, |m| m != *l)).count()
+        };
+        for (si, segdef) in SEGMENTS.iter().enumerate() {
+            if !segdef.loops {
+                continue;
+            }
+            let s = segment_start(si);
+            let sets: Vec<HashMap<usize, bool>> = (s..s + segdef.len).map(lit_set).collect();
+            let typical = sets.windows(2)
+                .map(|w| diff(&w[0], &w[1]))
+                .max()
+                .unwrap_or(0);
+            let wrap = diff(&sets[segdef.len - 1], &sets[0]);
+            assert!(
+                wrap <= typical.max(1),
+                "'{}': stripe wrap flips {} discs vs max in-loop {}",
                 segdef.name, wrap, typical
             );
         }

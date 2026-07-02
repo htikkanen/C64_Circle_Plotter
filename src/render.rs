@@ -43,6 +43,10 @@ pub struct DisplayOpts {
     pub ideal_render: bool,
     pub mux_overlay: bool,
     pub compute_error: bool,
+    /// Hardware-true preview: chars colored by the sticky color RAM plan,
+    /// sprites reduced to the exportable 1-bit near/far class (purple front /
+    /// blue behind chars), glitch off.
+    pub hw_true: bool,
 }
 
 impl Default for DisplayOpts {
@@ -60,8 +64,23 @@ impl Default for DisplayOpts {
             ideal_render: false,
             mux_overlay: false,
             compute_error: false,
+            hw_true: false,
         }
     }
+}
+
+/// C64 palette (Pepto), indexed by hardware color number.
+pub const C64_PALETTE: [[u8; 3]; 16] = [
+    [0x00, 0x00, 0x00], [0xff, 0xff, 0xff], [0x68, 0x37, 0x2b], [0x70, 0xa4, 0xb2],
+    [0x6f, 0x3d, 0x86], [0x58, 0x8d, 0x43], [0x35, 0x28, 0x79], [0xb8, 0xc7, 0x6f],
+    [0x6f, 0x4f, 0x25], [0x43, 0x39, 0x00], [0x9a, 0x67, 0x59], [0x44, 0x44, 0x44],
+    [0x6c, 0x6c, 0x6c], [0x9a, 0xd2, 0x84], [0x6c, 0x5e, 0xb5], [0x95, 0x95, 0x95],
+];
+
+/// Sprite depth class for the exportable 1-bit scheme: far (dark shades)
+/// renders blue behind chars, near renders purple in front.
+pub fn hw_sprite_far(a: &Assignment, glitch_frame: usize) -> bool {
+    shade_index(a, false, glitch_frame) <= 2
 }
 
 // ============================================================
@@ -339,6 +358,8 @@ pub fn render_frame(
     frame_positions: &FramePositions,
     opts: &DisplayOpts,
     override_alloc: Option<(&[Assignment], &[Option<u8>])>,
+    hw_colram: Option<&[u8]>,
+    spec: &SpecularParams,
 ) -> (Vec<u8>, FrameStats, Vec<u8>) {
     let spr_pixels = &*SPR_PIXELS;
     let char_pixels = &*CHAR_PIXELS;
@@ -405,14 +426,28 @@ pub fn render_frame(
     let glitch_color_active = frame_positions.glitch_color_active;
     let glitch_frame = frame_positions.glitch_frame;
 
-    // 4a. Render ghost sprites — background priority ($D01B=1), behind chars
+    // hw-true partitions sprites by the exportable 1-bit class instead of
+    // ghost/non-ghost. Trail segments: far class = blue behind chars (all
+    // ghosts). Specular segments: lit stripe = highlight color, all front.
+    let spec_seg = opts.hw_true && spec.enabled
+        && segment_is_specular(segment_at(glitch_frame).0);
+    let behind_sprite = |a: &Assignment| -> bool {
+        if opts.hw_true {
+            !spec_seg && hw_sprite_far(a, glitch_frame)
+        } else {
+            a.is_ghost
+        }
+    };
+
+    // 4a. Render behind-chars sprites — background priority ($D01B=1)
     //     Mux IRQ sets $D01B per instance, so this is C64 compatible.
     if opts.show_sprites {
         for slot in (0..8u8).rev() {
             for (ai, a) in asgn.iter().enumerate() {
-                if a.mode != DiscMode::Sprite || !a.is_ghost { continue; }
+                if a.mode != DiscMode::Sprite || !behind_sprite(a) { continue; }
                 if sprite_slot_map.get(ai).and_then(|s| *s) != Some(slot) { continue; }
-                let col = disc_color(a, glitch_color_active, glitch_frame);
+                let col = if opts.hw_true { C64_PALETTE[6] }
+                    else { disc_color(a, glitch_color_active, glitch_frame) };
                 let ox = a.x.floor() as i32 - 8;
                 let oy = a.y.floor() as i32 - 8;
                 for sr in 0..SPRITE_H {
@@ -498,7 +533,19 @@ pub fn render_frame(
     // Helper: determine sprite display color
     let sprite_col = |a: &Assignment, ai: usize| -> Option<[u8; 3]> {
         let has_slot = sprite_slot_map.get(ai).and_then(|s| *s).is_some();
-        if opts.c64only || !opts.color {
+        if opts.hw_true {
+            if !has_slot { return None; }
+            let lit = spec_seg
+                && specular_u(glitch_frame, a.x, a.y, spec)
+                    .map(|u| specular_lit(u, spec))
+                    .unwrap_or(false);
+            let col = if lit {
+                C64_PALETTE[(spec.c1 & 15) as usize]
+            } else {
+                C64_PALETTE[4]
+            };
+            Some(col)
+        } else if opts.c64only || !opts.color {
             if has_slot { Some(disc_color(a, glitch_color_active, glitch_frame)) } else { None }
         } else if has_slot {
             Some(COL_SPR)
@@ -519,7 +566,14 @@ pub fn render_frame(
 
                 let cell_color = color_ram[r * COLS + c];
 
-                let (fg, bg): ([u8; 3], [u8; 3]) = if opts.c64only {
+                let (fg, bg): ([u8; 3], [u8; 3]) = if opts.hw_true {
+                    // Hardware semantics: the cell's color RAM value colors
+                    // every char pixel in the cell (attribute clash included).
+                    let col = hw_colram
+                        .map(|cr| C64_PALETTE[(cr[r * COLS + c] & 15) as usize])
+                        .unwrap_or(C64_PALETTE[4]);
+                    (col, COL_BG)
+                } else if opts.c64only {
                     (cell_color.unwrap_or(COL_WHITE), COL_BG)
                 } else if opts.color && was_over && opts.corruption {
                     ([255, 212, 59], [60, 40, 0])
@@ -552,12 +606,12 @@ pub fn render_frame(
         }
     }
 
-    // 7. Render non-ghost sprites — foreground priority ($D01B = 0)
+    // 7. Render front sprites — foreground priority ($D01B = 0)
     //    Reverse slot order: slot 7 first → slot 0 last (highest priority on top)
     if opts.show_sprites {
         for slot in (0..8u8).rev() {
             for (ai, a) in asgn.iter().enumerate() {
-                if a.mode != DiscMode::Sprite || a.is_ghost { continue; }
+                if a.mode != DiscMode::Sprite || behind_sprite(a) { continue; }
                 if sprite_slot_map.get(ai).and_then(|s| *s) != Some(slot) { continue; }
                 if let Some(col) = sprite_col(a, ai) {
                     render_sprite(a, &col, false, &char_mask, &mut d);
@@ -747,6 +801,25 @@ fn render_sprite(
             }
             let idx = (sy as usize * C64W + sx as usize) * 4;
             set_rgb(d, idx, *col);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hw_true_render_smoke() {
+        let opts = DisplayOpts { hw_true: true, ..Default::default() };
+        let colram = vec![4u8; ROWS * COLS];
+        let spec = SpecularParams::default();
+        // xtend (trail model) and hold E (specular model)
+        for f in [100, 200] {
+            let fp = crate::sim::gen_positions(f);
+            let (px, stats, _) = render_frame(&fp, &opts, None, Some(&colram), &spec);
+            assert_eq!(px.len(), C64W * C64H * 4);
+            assert!(stats.visible > 0);
         }
     }
 }

@@ -4,22 +4,17 @@ use crate::render::shade_index;
 use crate::sim::*;
 
 // ---------------------------------------------------------------------------
-// C64 color mapping
+// C64 color mapping — 1-bit class model
 // ---------------------------------------------------------------------------
+// Every frame uses two colors. Specular segments: purple base + highlight
+// band (SpecularParams.c1) that tracks the camera/wobble. Trail segments:
+// blue ghosts/far discs + purple main discs. Glitch is a sprite-only effect;
+// char colors are glitch-free.
 
-/// Maps shade ramp index (0..6) to C64 color index.
-/// Ordered dark-to-light matching the shade ramp.
-const C64_SHADE_COLORS: [u8; 7] = [
-    0,   // 0: darkest  -> black
-    6,   // 1: DKBLUE   -> blue
-    6,   // 2: BLUE     -> blue
-    4,   // 3: PURPLE   -> purple
-    14,  // 4: LTBLUE   -> light blue
-    15,  // 5: CYAN     -> light grey
-    1,   // 6: WHITE    -> white
-];
+pub const COL_BASE: u8 = 4; // purple — also the C64 color RAM init fill
+pub const COL_GHOST: u8 = 6; // blue
 
-const C64_COLOR_NAMES: [&str; 16] = [
+pub const C64_COLOR_NAMES: [&str; 16] = [
     "black", "white", "red", "cyan", "purple", "green", "blue", "yellow",
     "orange", "brown", "light red", "dark grey", "grey", "light green",
     "light blue", "light grey",
@@ -47,7 +42,11 @@ pub(crate) struct ExportFrame {
 // Build export data from all frames
 // ---------------------------------------------------------------------------
 
-pub fn build_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec<ExportFrame> {
+pub fn build_export_data(
+    prune_dist: f64,
+    seq_frames: &[SeqFrame],
+    spec: &SpecularParams,
+) -> Vec<ExportFrame> {
     let mut frames = Vec::with_capacity(TOTAL_FRAMES);
 
     for f in 0..TOTAL_FRAMES {
@@ -66,12 +65,14 @@ pub fn build_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec<Export
             (alloc.asgn, alloc.sprite_slot_map)
         };
 
-        let glitch_color = fp.glitch_color_active;
         let glitch_frame = fp.glitch_frame;
 
-        // Collect char stamps with shade index and effective z
+        // Collect char stamps with their 1-bit class color. `rank` orders the
+        // streams: the rank-1 stream paints last and wins shared cells
+        // (highlight over base; main discs over ghosts).
         struct StampEntry {
-            shade_idx: usize,
+            rank: u8,
+            c64_color: u8,
             eff_z: f64,
             screen_offset: u16,
             stamp_index: u8,
@@ -82,7 +83,22 @@ pub fn build_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec<Export
         for a in &asgn {
             if a.mode != DiscMode::Char { continue; }
 
-            let si = shade_index(a, glitch_color, glitch_frame);
+            let spec_u = if spec.enabled {
+                specular_u(f, a.x, a.y, spec)
+            } else {
+                None
+            };
+            let (rank, c64_color) = if let Some(u) = spec_u {
+                if specular_lit(u, spec) {
+                    (1, spec.c1)
+                } else {
+                    (0, COL_BASE)
+                }
+            } else if shade_index(a, false, glitch_frame) <= 2 {
+                (0, COL_GHOST)
+            } else {
+                (1, COL_BASE)
+            };
             let eff_z = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
 
             // Compute stamp index from sub-pixel position
@@ -102,17 +118,17 @@ pub fn build_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec<Export
             let screen_offset = (br as u16) * (COLS as u16) + (bc as u16);
 
             entries.push(StampEntry {
-                shade_idx: si,
+                rank,
+                c64_color,
                 eff_z,
                 screen_offset,
                 stamp_index: stamp_idx,
             });
         }
 
-        // Group by shade index, order groups dark-to-light (ascending)
-        // Within each group, order by effective z descending (back first, front writes last)
+        // Order by paint rank, back-to-front within each rank
         entries.sort_by(|a, b| {
-            a.shade_idx.cmp(&b.shade_idx)
+            a.rank.cmp(&b.rank)
                 .then(b.eff_z.total_cmp(&a.eff_z)) // back first within group
         });
 
@@ -120,9 +136,9 @@ pub fn build_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec<Export
         let mut streams: Vec<ExportStream> = Vec::new();
         let mut i = 0;
         while i < entries.len() {
-            let c64_col = C64_SHADE_COLORS[entries[i].shade_idx];
+            let c64_col = entries[i].c64_color;
             let mut stamps = Vec::new();
-            while i < entries.len() && C64_SHADE_COLORS[entries[i].shade_idx] == c64_col {
+            while i < entries.len() && entries[i].c64_color == c64_col {
                 stamps.push(ExportStamp {
                     screen_offset: entries[i].screen_offset,
                     stamp_index: entries[i].stamp_index,
@@ -290,14 +306,20 @@ pub fn serialize_text(frames: &[ExportFrame]) -> String {
 }
 
 // ===========================================================================
-// Sprite export (v3 flat format — no color/priority)
+// Sprite export (v4 flat format — 1-bit color class per sprite)
 // ===========================================================================
 
 pub(crate) struct ExportSpriteFrame {
-    sprites: Vec<(u16, u8)>, // (x, y) VIC coords, Y-sorted ascending
+    sprites: Vec<(u16, u8, bool)>, // (x, y, class1) VIC coords, Y-sorted
+    color0: u8, // bits 0-3: C64 color, bit 7: class-0 sprites behind chars
+    color1: u8, // same for class 1
 }
 
-pub fn build_sprite_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec<ExportSpriteFrame> {
+pub fn build_sprite_export_data(
+    prune_dist: f64,
+    seq_frames: &[SeqFrame],
+    spec: &SpecularParams,
+) -> Vec<ExportSpriteFrame> {
     let mut frames = Vec::with_capacity(TOTAL_FRAMES);
 
     for f in 0..TOTAL_FRAMES {
@@ -315,12 +337,30 @@ pub fn build_sprite_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec
             (alloc.asgn, alloc.sprite_slot_map)
         };
 
-        let mut sprites: Vec<(u16, u8)> = Vec::new();
+        // Frame color pair — mirrors the char stream colors: specular
+        // segments are base + highlight (all in front), trail segments are
+        // main + far/ghost class rendered behind chars (bit 7).
+        let is_spec = spec.enabled && segment_is_specular(segment_at(f).0);
+        let (color0, color1) = if is_spec {
+            (COL_BASE, spec.c1 & 15)
+        } else {
+            (COL_BASE, COL_GHOST | 0x80)
+        };
+
+        let mut sprites: Vec<(u16, u8, bool)> = Vec::new();
 
         for (ai, a) in asgn.iter().enumerate() {
             if a.mode != DiscMode::Sprite { continue; }
             if a.is_ghost { continue; }
             if sprite_slot_map.get(ai).and_then(|s| *s).is_none() { continue; }
+
+            let class1 = if is_spec {
+                specular_u(f, a.x, a.y, spec)
+                    .map(|u| specular_lit(u, spec))
+                    .unwrap_or(false)
+            } else {
+                shade_index(a, false, f) <= 2
+            };
 
             let ox = a.x.floor() as i32 - 8;
             let oy = a.y.floor() as i32 - 8;
@@ -328,19 +368,19 @@ pub fn build_sprite_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec
             let x = (ox + 24).max(0) as u16;
             let y = (oy + 51).clamp(0, 255) as u8;
 
-            sprites.push((x, y));
+            sprites.push((x, y, class1));
         }
 
-        sprites.sort_by_key(|&(_, y)| y);
+        sprites.sort_by_key(|&(_, y, _)| y);
 
-        frames.push(ExportSpriteFrame { sprites });
+        frames.push(ExportSpriteFrame { sprites, color0, color1 });
     }
 
     frames
 }
 
 // ---------------------------------------------------------------------------
-// Sprite binary serialization (v3 flat format)
+// Sprite binary serialization (v4 flat format)
 // ---------------------------------------------------------------------------
 //
 // Header:
@@ -349,8 +389,13 @@ pub fn build_sprite_export_data(prune_dist: f64, seq_frames: &[SeqFrame]) -> Vec
 //
 // Per frame:
 //   [total_count: u8]
-//   [x_hi_init: u8]              bits for sprites 0-7
+//   [color0: u8]                 bits 0-3: C64 color of class-0 sprites,
+//                                bit 7: class-0 sprites behind chars ($D01B)
+//   [color1: u8]                 same for class-1 sprites
+//   [x_hi_init: u8]              x_hi bits for sprites 0-7
 //   [x_hi_overflow: u8 × N]     ceil((count-8)/8) bytes, 0 if count <= 8
+//   [class_init: u8]             class bits for sprites 0-7
+//   [class_overflow: u8 × N]    same packing as x_hi
 //   [y, x_lo] × total_count     2 bytes per sprite, Y-sorted ascending
 // ---------------------------------------------------------------------------
 
@@ -366,19 +411,27 @@ pub fn serialize_sprite_binary(frames: &[ExportSpriteFrame]) -> Vec<u8> {
             let mut fd = Vec::new();
             let count = frame.sprites.len();
             fd.push(count as u8);
+            fd.push(frame.color0);
+            fd.push(frame.color1);
 
-            // x_hi bytes: first byte covers sprites 0-7, then one byte per 8 additional
-            let x_hi_bytes = 1 + if count > 8 { (count - 8 + 7) / 8 } else { 0 };
-            let mut x_hi = vec![0u8; x_hi_bytes];
-            for (i, &(x, _)) in frame.sprites.iter().enumerate() {
+            // Bitmask packing: first byte covers sprites 0-7, then one byte
+            // per 8 additional — same layout for x_hi and class bits
+            let mask_bytes = 1 + if count > 8 { (count - 8 + 7) / 8 } else { 0 };
+            let mut x_hi = vec![0u8; mask_bytes];
+            let mut class = vec![0u8; mask_bytes];
+            for (i, &(x, _, c1)) in frame.sprites.iter().enumerate() {
                 if x > 255 {
                     x_hi[i / 8] |= 1 << (i % 8);
                 }
+                if c1 {
+                    class[i / 8] |= 1 << (i % 8);
+                }
             }
             fd.extend_from_slice(&x_hi);
+            fd.extend_from_slice(&class);
 
             // Sprite data: [y, x_lo] per sprite
-            for &(x, y) in &frame.sprites {
+            for &(x, y, _) in &frame.sprites {
                 fd.push(y);
                 fd.push((x & 0xFF) as u8);
             }
@@ -430,8 +483,9 @@ pub fn serialize_sprite_text(frames: &[ExportSpriteFrame]) -> String {
     let num_frames = frames.len();
 
     let mut s = String::new();
-    s.push_str(&format!("// C64 Sprite Export v3 — {} frames, {} bytes\n", num_frames, bin.len()));
-    s.push_str("// Per frame: [count] [x_hi_init] [x_hi_overflow...] [y, x_lo]...\n\n");
+    s.push_str(&format!("// C64 Sprite Export v4 — {} frames, {} bytes\n", num_frames, bin.len()));
+    s.push_str("// Per frame: [count] [color0] [color1] [x_hi...] [class...] [y, x_lo]...\n");
+    s.push_str("// color bytes: bits 0-3 C64 color, bit 7 = class rendered behind chars\n\n");
 
     s.push_str("const unsigned char sprite_data[] = {\n");
 
@@ -473,25 +527,41 @@ pub fn serialize_sprite_text(frames: &[ExportSpriteFrame]) -> String {
         s.push_str(&format!("  0x{:02x},        // count={}\n", bin[pos], count));
         pos += 1;
 
-        // x_hi bytes
-        let x_hi_bytes = 1 + if count > 8 { (count - 8 + 7) / 8 } else { 0 };
-        for b in 0..x_hi_bytes {
-            let label = if b == 0 { "x_hi_init" } else { &format!("x_hi_overflow[{}]", b - 1) };
-            s.push_str(&format!("  0x{:02x},        // {} = {:08b}\n",
-                bin[pos], label, bin[pos]));
+        // Frame color pair
+        for (label, col) in [("color0", frame.color0), ("color1", frame.color1)] {
+            s.push_str(&format!("  0x{:02x},        // {} = {} ({}){}\n",
+                bin[pos], label, col & 15,
+                C64_COLOR_NAMES[(col & 15) as usize],
+                if col & 0x80 != 0 { " [behind chars]" } else { "" }));
             pos += 1;
         }
 
+        // x_hi + class bitmask bytes
+        let mask_bytes = 1 + if count > 8 { (count - 8 + 7) / 8 } else { 0 };
+        for (name, _) in [("x_hi", 0), ("class", 1)] {
+            for b in 0..mask_bytes {
+                let label = if b == 0 {
+                    format!("{}_init", name)
+                } else {
+                    format!("{}_overflow[{}]", name, b - 1)
+                };
+                s.push_str(&format!("  0x{:02x},        // {} = {:08b}\n",
+                    bin[pos], label, bin[pos]));
+                pos += 1;
+            }
+        }
+
         // Sprite data
-        for (i, &(x, y)) in frame.sprites.iter().enumerate() {
-            let x_hi_bit = if x > 255 { 1 } else { 0 };
-            let x_note = if x_hi_bit != 0 {
-                format!(" (x_hi bit {}:{})", i / 8, i % 8)
-            } else {
-                String::new()
-            };
+        for (i, &(x, y, c1)) in frame.sprites.iter().enumerate() {
+            let mut notes = String::new();
+            if x > 255 {
+                notes.push_str(&format!(" (x_hi bit {}:{})", i / 8, i % 8));
+            }
+            if c1 {
+                notes.push_str(" [class1]");
+            }
             s.push_str(&format!("  0x{:02x}, 0x{:02x},  // y={} x={}{}\n",
-                bin[pos], bin[pos + 1], y, x, x_note));
+                bin[pos], bin[pos + 1], y, x, notes));
             pos += 2;
         }
     }
@@ -504,11 +574,11 @@ pub fn serialize_sprite_text(frames: &[ExportSpriteFrame]) -> String {
 // Frame uniqueness analysis
 // ---------------------------------------------------------------------------
 
-pub fn analyze_memory(prune_dist: f64, seq_frames: &[SeqFrame]) {
+pub fn analyze_memory(prune_dist: f64, seq_frames: &[SeqFrame], spec: &SpecularParams) {
     use std::collections::HashMap;
 
-    let stamp_frames = build_export_data(prune_dist, seq_frames);
-    let sprite_frames = build_sprite_export_data(prune_dist, seq_frames);
+    let stamp_frames = build_export_data(prune_dist, seq_frames, spec);
+    let sprite_frames = build_sprite_export_data(prune_dist, seq_frames, spec);
 
     fn stamp_frame_data(frame: &ExportFrame) -> Vec<u8> {
         let single = serialize_binary(&[ExportFrame {
@@ -527,6 +597,8 @@ pub fn analyze_memory(prune_dist: f64, seq_frames: &[SeqFrame]) {
         if frame.sprites.is_empty() { return vec![]; }
         let single = serialize_sprite_binary(&[ExportSpriteFrame {
             sprites: frame.sprites.clone(),
+            color0: frame.color0,
+            color1: frame.color1,
         }]);
         single[4..].to_vec()
     }
@@ -643,6 +715,91 @@ pub fn export_playlist(repeats: &[u16]) -> (usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Color RAM plan (hw-true preview, mirrors the C64 color pass)
+// ---------------------------------------------------------------------------
+//
+// Models the C64 writer: color RAM is initialized once to COL_BASE and never
+// cleared. Each frame, a clear-shaped color pass repaints every stamp's cells
+// with its stream color in the bottom-border window (before the char flip at
+// line 0), walking the about-to-flip frame's data. Full repaint = stateless:
+// covered cells always show the current frame's color; uncovered cells keep
+// stale values invisibly. Mono segments skip the pass entirely.
+
+/// Approximate color-pass cost per stamp: ~50 cycles parse/dispatch plus
+/// ~8 per non-empty cell (avg 11 cells in the circle stamp set).
+pub const COLOR_PASS_CYCLES_PER_STAMP: usize = 140;
+
+pub struct ColramPlan {
+    pub states: Vec<Vec<u8>>, // per presentation step: color RAM after the pass
+    pub stamps: Vec<u16>,     // color-pass stamps per step (CPU cost)
+    pub changed: Vec<u16>,    // cells whose displayed color actually changed
+    pub prune_dist: f64,
+}
+
+pub fn build_colram_plan(
+    prune_dist: f64,
+    seq_frames: &[SeqFrame],
+    spec: &SpecularParams,
+    seg_colored: &[bool],
+    pres_map: &[u32],
+) -> ColramPlan {
+    let frames = build_export_data(prune_dist, seq_frames, spec);
+    let cells = ROWS * COLS;
+    let stamps_table = &*STAMPS_TABLE;
+
+    // Per data frame: coverage + color per cell. Replaying the streams in
+    // export order matches the C64 paint order, so the last writer of a
+    // shared cell wins — same rule for chars and colors.
+    let mut covered: Vec<Vec<bool>> = Vec::with_capacity(frames.len());
+    let mut req: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
+    for frame in &frames {
+        let mut cov = vec![false; cells];
+        let mut rc = vec![COL_BASE; cells];
+        for stream in &frame.streams {
+            for stamp in &stream.stamps {
+                for sc in &stamps_table[stamp.stamp_index as usize] {
+                    let cell = stamp.screen_offset as usize
+                        + sc.dr as usize * COLS + sc.dc as usize;
+                    if cell < cells {
+                        cov[cell] = true;
+                        rc[cell] = stream.c64_color;
+                    }
+                }
+            }
+        }
+        covered.push(cov);
+        req.push(rc);
+    }
+
+    // Replay the full-repaint pass over the presentation (loops included).
+    let mut ram = vec![COL_BASE; cells];
+    let mut states = Vec::with_capacity(pres_map.len());
+    let mut stamps = Vec::with_capacity(pres_map.len());
+    let mut changed = Vec::with_capacity(pres_map.len());
+
+    for &pf in pres_map {
+        let f = pf as usize;
+        let (seg, _) = segment_at(f);
+        let mut st = 0usize;
+        let mut ch = 0usize;
+        if seg_colored.get(seg).copied().unwrap_or(false) {
+            st = frames[f].streams.iter().map(|s| s.stamps.len()).sum();
+            for c in 0..cells {
+                if covered[f][c] && ram[c] != req[f][c] {
+                    ram[c] = req[f][c];
+                    ch += 1;
+                }
+            }
+        }
+        states.push(ram.clone());
+        stamps.push(st as u16);
+        changed.push(ch as u16);
+    }
+
+    ColramPlan { states, stamps, changed, prune_dist }
+}
+
+// ---------------------------------------------------------------------------
 // C64 memory budgets — must match prt_circleplotter.asm and spindle.txt:
 // stamps.bin at $5800, sprites.bin at $9000, playlist.bin at $cf00.
 // ---------------------------------------------------------------------------
@@ -655,8 +812,12 @@ pub const PLAYLIST_BUDGET: usize = 0xd000 - 0xcf00; // 256
 // Top-level export functions
 // ---------------------------------------------------------------------------
 
-pub fn export_stamps(prune_dist: f64, seq_frames: &[SeqFrame]) -> (usize, usize) {
-    let frames = build_export_data(prune_dist, seq_frames);
+pub fn export_stamps(
+    prune_dist: f64,
+    seq_frames: &[SeqFrame],
+    spec: &SpecularParams,
+) -> (usize, usize) {
+    let frames = build_export_data(prune_dist, seq_frames, spec);
     let bin = serialize_binary(&frames);
     let txt = serialize_text(&frames);
 
@@ -669,8 +830,12 @@ pub fn export_stamps(prune_dist: f64, seq_frames: &[SeqFrame]) -> (usize, usize)
     (bin_size, txt_size)
 }
 
-pub fn export_sprites(prune_dist: f64, seq_frames: &[SeqFrame]) -> (usize, usize) {
-    let frames = build_sprite_export_data(prune_dist, seq_frames);
+pub fn export_sprites(
+    prune_dist: f64,
+    seq_frames: &[SeqFrame],
+    spec: &SpecularParams,
+) -> (usize, usize) {
+    let frames = build_sprite_export_data(prune_dist, seq_frames, spec);
     let bin = serialize_sprite_binary(&frames);
     let txt = serialize_sprite_text(&frames);
 

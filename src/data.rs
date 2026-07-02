@@ -87,6 +87,34 @@ pub fn segment_at(f: usize) -> (usize, usize) {
     (SEGMENTS.len() - 1, SEGMENTS[SEGMENTS.len() - 1].len - 1)
 }
 
+/// Segments whose color model is the specular highlight (1-bit class:
+/// purple base / highlight). The other segments use the trail model
+/// (purple main discs / blue ghosts, ghosts behind chars).
+pub fn segment_is_specular(seg: usize) -> bool {
+    (SEG_MORPH..SEG_EXIT).contains(&seg)
+}
+
+/// Specular envmap parameters. Units are the sampling coordinate `u`
+/// (screen height ≈ 1.0, a letter is ~0.5 tall at zoom 3). The reflection is
+/// sampled from screen position + wobble tilt (see sim::specular_u), so it's
+/// camera-synced by construction; `period` well above the visible span makes
+/// the stripe effectively non-tiling.
+#[derive(Clone, Copy, PartialEq)]
+pub struct SpecularParams {
+    pub enabled: bool,
+    pub c1: u8,      // C64 color of the lit class
+    pub width: f64,  // half-width of a lit stripe
+    pub slant: f64,  // yaw mix: x contribution to the stripe axis
+    pub period: f64, // stripe spacing in the environment profile
+    pub sweep: f64,  // reflection travel per wobble cycle
+}
+
+impl Default for SpecularParams {
+    fn default() -> Self {
+        Self { enabled: true, c1: 14, width: 0.12, slant: 0.15, period: 1.2, sweep: 0.35 }
+    }
+}
+
 // Loop boundaries must sit in the beat-pulse dead zone (frame % 25 in 13..24)
 // so the wrap carries no pulse/shake discontinuity.
 const _: () = {

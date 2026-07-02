@@ -20,6 +20,7 @@ struct C64App {
     frame: usize,
     playing: bool,
     speed: f32,
+    view_scale: f32,
     opts: render::DisplayOpts,
     corrupt_total: u32,
     last_corrupt_frame: Option<usize>,
@@ -50,6 +51,19 @@ struct C64App {
     loop_preview: bool,
     pres_frame: usize,     // index into pres_map when loop_preview is on
     pres_map: Vec<u32>,    // presentation frame -> data frame
+
+    // Hardware-true preview (sticky color RAM simulation)
+    seg_colored: Vec<bool>,
+    colram_plan: Option<export::ColramPlan>,
+    colram_dirty: bool,
+    spec: data::SpecularParams,
+}
+
+/// Default color RAM usage: all segments colored. Writes only happen where a
+/// cell's shade differs from the purple base, so uniform segments cost ~0 —
+/// the per-segment toggles exist to A/B mono vs colored by eye.
+fn default_seg_colored() -> Vec<bool> {
+    vec![true; data::SEGMENTS.len()]
 }
 
 /// Expand the segment playlist into a presentation -> data frame map.
@@ -80,7 +94,11 @@ impl C64App {
             frame: 0,
             playing: true,
             speed: 1.0,
-            opts: render::DisplayOpts::default(),
+            view_scale: data::SCALE as f32,
+            opts: render::DisplayOpts {
+                hw_true: true, // hardware-true preview is the working mode
+                ..Default::default()
+            },
             corrupt_total: 0,
             last_corrupt_frame: None,
             accum_mem_bytes: 0,
@@ -101,6 +119,19 @@ impl C64App {
             pres_frame: 0,
             pres_map: build_pres_map(
                 &data::SEGMENTS.iter().map(|s| s.default_repeats).collect::<Vec<_>>()),
+            seg_colored: default_seg_colored(),
+            colram_plan: None,
+            colram_dirty: false,
+            spec: data::SpecularParams::default(),
+        }
+    }
+
+    /// Presentation index of the currently shown frame (for colram plan lookup).
+    fn plan_index(&self) -> usize {
+        if self.loop_preview {
+            self.pres_frame.min(self.pres_map.len().saturating_sub(1))
+        } else {
+            self.pres_map.iter().position(|&d| d as usize == self.frame).unwrap_or(0)
         }
     }
 
@@ -155,10 +186,22 @@ impl C64App {
         let opt_override = self.get_opt_override();
         let override_ref = opt_override.as_ref().map(|(a, s)| (a.as_slice(), s.as_slice()));
 
+        // Color RAM state for the hw-true preview
+        let pidx = self.plan_index();
+        let hw_colram = if self.opts.hw_true {
+            self.colram_plan.as_ref()
+                .and_then(|p| p.states.get(pidx))
+                .map(|s| s.as_slice())
+        } else {
+            None
+        };
+
         let (pixels, stats, sl_counts) = render::render_frame(
             &positions,
             &self.opts,
             override_ref,
+            hw_colram,
+            &self.spec,
         );
 
         // Update counters (only once per frame — avoids inflation on repaints)
@@ -368,6 +411,7 @@ impl eframe::App for C64App {
                     self.seq_frames[self.seq_current_frame].baseline = p.baseline_score;
                     if let Some(ref state) = p.best_state {
                         self.seq_frames[self.seq_current_frame].result = Some(state.clone());
+                        self.colram_dirty = true;
                     }
                     drop(p);
                     self.seq_current_frame += 1;
@@ -375,6 +419,25 @@ impl eframe::App for C64App {
                     ctx.request_repaint();
                 }
             }
+        }
+
+        // --- Rebuild the color RAM plan when hw-true needs it ---
+        if let Some(ref p) = self.colram_plan {
+            if p.prune_dist != self.opts.prune_dist || p.states.len() != self.pres_map.len() {
+                self.colram_dirty = true;
+            }
+        }
+        if self.opts.hw_true && !self.seq_running
+            && (self.colram_plan.is_none() || self.colram_dirty)
+        {
+            self.colram_plan = Some(export::build_colram_plan(
+                self.opts.prune_dist,
+                &self.seq_frames,
+                &self.spec,
+                &self.seg_colored,
+                &self.pres_map,
+            ));
+            self.colram_dirty = false;
         }
 
         // --- Render the C64 frame ---
@@ -420,11 +483,19 @@ impl eframe::App for C64App {
             ui.style_mut().visuals.panel_fill = egui::Color32::from_rgb(0x0c, 0x0c, 0x10);
 
             ui.vertical_centered(|ui| {
+                // Scale the C64 view to the available space (integer factor
+                // for crisp pixels; ~130px reserved for controls below).
+                let avail = ui.available_size();
+                self.view_scale = ((avail.y - 130.0) / data::C64H as f32)
+                    .min(avail.x / data::C64W as f32)
+                    .floor()
+                    .max(1.0);
+
                 // Main C64 display — hold mouse to compare with baseline
                 if let Some(tex) = &self.texture {
                     let size = egui::vec2(
-                        (data::C64W * data::SCALE) as f32,
-                        (data::C64H * data::SCALE) as f32,
+                        data::C64W as f32 * self.view_scale,
+                        data::C64H as f32 * self.view_scale,
                     );
                     let image = egui::Image::new(tex)
                         .fit_to_exact_size(size)
@@ -466,6 +537,7 @@ impl eframe::App for C64App {
                     option_toggle_compact(ui, "Sprites", &mut self.opts.show_sprites);
                     option_toggle_compact(ui, "Error", &mut self.opts.error_overlay);
                     option_toggle_compact(ui, "Ideal", &mut self.opts.ideal_render);
+                    option_toggle_compact(ui, "HW", &mut self.opts.hw_true);
                 });
             });
         });
@@ -555,7 +627,7 @@ impl C64App {
     // -----------------------------------------------------------------------
     fn draw_timeline(&mut self, ui: &mut egui::Ui) {
         let desired_size = egui::vec2(
-            (data::C64W * data::SCALE) as f32,
+            data::C64W as f32 * self.view_scale,
             32.0,
         );
         let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::click_and_drag());
@@ -684,12 +756,21 @@ impl C64App {
                         }
                         ui.colored_label(COL_DIM,
                             egui::RichText::new(format!("{} fr", seg.len)).size(11.0));
+                        let mut colr = self.seg_colored[i];
+                        if ui.checkbox(&mut colr, egui::RichText::new("col").size(9.0))
+                            .on_hover_text("color RAM writes in this segment (HW preview)")
+                            .changed()
+                        {
+                            self.seg_colored[i] = colr;
+                            self.colram_dirty = true;
+                        }
                     });
                 });
             }
             if repeats_changed {
                 self.pres_map = build_pres_map(&self.seg_repeats);
                 self.sync_pres_to_frame();
+                self.colram_dirty = true;
             }
 
             ui.separator();
@@ -704,6 +785,71 @@ impl C64App {
                 self.sync_pres_to_frame();
             }
         });
+
+        // -- HW preview: specular + color pass stats --
+        if self.opts.hw_true {
+            let plan_stats = self.colram_plan.as_ref().map(|plan| {
+                let pidx = self.plan_index();
+                (
+                    plan.stamps.get(pidx).copied().unwrap_or(0),
+                    plan.changed.get(pidx).copied().unwrap_or(0),
+                    plan.stamps.iter().copied().max().unwrap_or(0),
+                )
+            });
+            draw_panel(ui, "SPECULAR / COLOR (HW)", |ui| {
+                let mut spec_changed = false;
+                spec_changed |= ui.checkbox(&mut self.spec.enabled,
+                    egui::RichText::new("Specular highlight").size(10.0)).changed();
+                ui.horizontal(|ui| {
+                    ui.colored_label(COL_DIM, egui::RichText::new("C1 color").size(10.0));
+                    spec_changed |= ui.add(egui::DragValue::new(&mut self.spec.c1)
+                        .range(0..=15)).changed();
+                    let name = export::C64_COLOR_NAMES[(self.spec.c1 & 15) as usize];
+                    ui.colored_label(COL_DIM, egui::RichText::new(name).size(10.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.colored_label(COL_DIM, egui::RichText::new("Width").size(10.0));
+                    spec_changed |= ui.add(egui::Slider::new(&mut self.spec.width, 0.02..=0.4)
+                        .step_by(0.01)).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.colored_label(COL_DIM, egui::RichText::new("Slant").size(10.0));
+                    spec_changed |= ui.add(egui::Slider::new(&mut self.spec.slant, 0.0..=0.5)
+                        .step_by(0.01)).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.colored_label(COL_DIM, egui::RichText::new("Period").size(10.0));
+                    spec_changed |= ui.add(egui::Slider::new(&mut self.spec.period, 0.2..=3.0)
+                        .step_by(0.05)).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.colored_label(COL_DIM, egui::RichText::new("Sweep").size(10.0));
+                    spec_changed |= ui.add(egui::Slider::new(&mut self.spec.sweep, 0.0..=1.0)
+                        .step_by(0.05)).changed();
+                });
+                if spec_changed {
+                    self.colram_dirty = true;
+                }
+
+                ui.separator();
+                match plan_stats {
+                    Some((st, ch, mx)) => {
+                        let lines = |s: u16| {
+                            (s as usize * export::COLOR_PASS_CYCLES_PER_STAMP) as f64 / 63.0
+                        };
+                        stat_row(ui, "Color pass",
+                            &format!("{} stamps (~{:.0} lines)", st, lines(st)), COL_CHAR);
+                        stat_row(ui, "Worst frame",
+                            &format!("{} stamps (~{:.0} lines)", mx, lines(mx)), COL_TEXT);
+                        stat_row(ui, "Cells changed", &ch.to_string(), COL_DIM);
+                    }
+                    None => {
+                        ui.colored_label(COL_DIM,
+                            egui::RichText::new("building plan...").size(10.0));
+                    }
+                }
+            });
+        }
 
         // -- Optimizer --
         draw_panel(ui, "OPTIMIZER", |ui| {
@@ -818,10 +964,12 @@ impl C64App {
                 let (st_bin, _st_txt) = export::export_stamps(
                     self.opts.prune_dist,
                     &self.seq_frames,
+                    &self.spec,
                 );
                 let (sp_bin, _sp_txt) = export::export_sprites(
                     self.opts.prune_dist,
                     &self.seq_frames,
+                    &self.spec,
                 );
                 let (pl_bin, _pl_txt) = export::export_playlist(&self.seg_repeats);
                 let budget = |used: usize, avail: usize| -> String {
@@ -916,9 +1064,10 @@ fn headless_export() {
     let seq_frames = vec![SeqFrame::default(); data::TOTAL_FRAMES];
     let prune_dist = render::DisplayOpts::default().prune_dist;
     let repeats: Vec<u16> = data::SEGMENTS.iter().map(|s| s.default_repeats).collect();
+    let spec = data::SpecularParams::default();
 
-    let (st_bin, _) = export::export_stamps(prune_dist, &seq_frames);
-    let (sp_bin, _) = export::export_sprites(prune_dist, &seq_frames);
+    let (st_bin, _) = export::export_stamps(prune_dist, &seq_frames, &spec);
+    let (sp_bin, _) = export::export_sprites(prune_dist, &seq_frames, &spec);
     let (pl_bin, _) = export::export_playlist(&repeats);
 
     let report = |name: &str, used: usize, avail: usize| {
@@ -935,7 +1084,32 @@ fn headless_export() {
     eprintln!("  {} data frames, {} presented frames ({:.1}s at 50fps)",
         data::TOTAL_FRAMES, pres, pres as f64 / data::FPS);
     eprintln!();
-    export::analyze_memory(prune_dist, &seq_frames);
+    export::analyze_memory(prune_dist, &seq_frames, &spec);
+
+    // Color pass stats (hw-true preview, full-repaint writer)
+    let seg_colored = default_seg_colored();
+    let pres_map = build_pres_map(&repeats);
+    let plan = export::build_colram_plan(prune_dist, &seq_frames, &spec, &seg_colored, &pres_map);
+    eprintln!();
+    eprintln!("=== Color pass (full repaint, ~{} cycles/stamp) ===",
+        export::COLOR_PASS_CYCLES_PER_STAMP);
+    for (i, seg) in data::SEGMENTS.iter().enumerate() {
+        let idxs: Vec<usize> = pres_map.iter().enumerate()
+            .filter(|(_, &d)| data::segment_at(d as usize).0 == i)
+            .map(|(p, _)| p)
+            .collect();
+        let st: Vec<u16> = idxs.iter().map(|&p| plan.stamps[p]).collect();
+        let ch: Vec<u16> = idxs.iter().map(|&p| plan.changed[p]).collect();
+        let avg = st.iter().map(|&w| w as usize).sum::<usize>() as f64 / st.len().max(1) as f64;
+        let max_st = st.iter().max().copied().unwrap_or(0);
+        eprintln!("  {:7} {} | color stamps avg {:5.1} max {:3} (~{:.0} lines) | cells changed avg {:5.1}",
+            seg.name,
+            if seg_colored[i] { "col " } else { "mono" },
+            avg,
+            max_st,
+            (max_st as usize * export::COLOR_PASS_CYCLES_PER_STAMP) as f64 / 63.0,
+            ch.iter().map(|&c| c as usize).sum::<usize>() as f64 / ch.len().max(1) as f64);
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -947,6 +1121,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 700.0])
+            .with_maximized(true)
             .with_title("C64 Circle FX — Generic Allocator"),
         ..Default::default()
     };
