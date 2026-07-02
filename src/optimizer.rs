@@ -167,8 +167,10 @@ fn mutate(state: &mut OptState, rng: &mut SmallRng) -> bool {
         if dx == 0.0 && dy == 0.0 { return false; }
         let new_x = state.asgn[idx].x + dx;
         let new_y = state.asgn[idx].y + dy;
-        let new_stamp = get_stamp_cells(new_x, new_y);
-        if new_stamp.is_empty() { return false; }
+        // Clipped stamps must never become chars: the C64 writes the full
+        // glyph and would clobber memory past the screen
+        let (new_stamp, clipped) = get_stamp_cells_with_clip(new_x, new_y);
+        if new_stamp.is_empty() || clipped { return false; }
         state.asgn[idx].x = new_x;
         state.asgn[idx].y = new_y;
         state.asgn[idx].stamp = new_stamp;
@@ -193,6 +195,10 @@ fn mutate(state: &mut OptState, rng: &mut SmallRng) -> bool {
         if sprites.is_empty() { return false; }
         let idx = sprites[rng.random_range(0..sprites.len())];
         if state.asgn[idx].stamp.is_empty() { return false; }
+        // Force-sprite discs at screen edges have partial (clipped) stamps —
+        // never turn those into chars (C64 writes the full glyph)
+        let (_, clipped) = get_stamp_cells_with_clip(state.asgn[idx].x, state.asgn[idx].y);
+        if clipped { return false; }
         state.asgn[idx].mode = DiscMode::Char;
         state.modes[idx] = DiscMode::Char;
         state.sprite_slot_map = rebuild_sprite_slots(&state.asgn);

@@ -113,6 +113,16 @@ pub fn build_export_data(
                 continue; // skip edge stamps that shouldn't be char mode
             }
 
+            // Safety net: the C64 writes the stamp's full glyph, so a
+            // viewport-clipped stamp would clobber memory past the screen
+            // (charset corruption). Such stamps must never reach the export.
+            let (_, stamp_clipped) = get_stamp_cells_with_clip(a.x, a.y);
+            if stamp_clipped {
+                eprintln!("WARNING: frame {}: clipped char stamp at ({:.0},{:.0}) skipped in export",
+                    f, a.x, a.y);
+                continue;
+            }
+
             let screen_offset = (br as u16) * (COLS as u16) + (bc as u16);
 
             entries.push(StampEntry {
@@ -369,7 +379,13 @@ pub fn build_sprite_export_data(
             let oy = a.y.floor() as i32 - 8;
 
             let x = (ox + 24).max(0) as u16;
-            let y = (oy + 51).clamp(0, 255) as u8;
+            let vy = oy + 51;
+            // Fully invisible sprites (above/below the display window) would
+            // only waste mux slots and stretch the IRQ chain past the sync
+            if vy > 250 || vy + (SPRITE_H as i32) < 50 {
+                continue;
+            }
+            let y = vy.clamp(0, 255) as u8;
 
             sprites.push((x, y, class1));
         }
@@ -674,6 +690,8 @@ pub fn analyze_memory(prune_dist: f64, seq_frames: &[SeqFrame], spec: &SpecularP
 //     end_lo,   end_hi     z_frame offset past last frame  (end_frame * 2)
 //     repeats              play count (0 = 256)
 //     flags                bit 0: skip the color pass in this segment
+//                          bit 1: refill color RAM with the base color when
+//                                 the segment starts (one-shot cleanup)
 
 pub fn serialize_playlist(repeats: &[u16]) -> (Vec<u8>, String) {
     let mut bin: Vec<u8> = Vec::new();
@@ -695,7 +713,8 @@ pub fn serialize_playlist(repeats: &[u16]) -> (Vec<u8>, String) {
         let start = (segment_start(i) * 2) as u16;
         let end = ((segment_start(i) + seg.len) * 2) as u16;
         let reps = if seg.loops { repeats[i].clamp(1, 255) as u8 } else { 1 };
-        let flags = if seg.color_pass { 0u8 } else { 1u8 };
+        let flags = (if seg.color_pass { 0u8 } else { 1u8 })
+            | (if seg.wipe_on_entry { 2u8 } else { 0u8 });
         bin.push((start & 0xFF) as u8);
         bin.push((start >> 8) as u8);
         bin.push((end & 0xFF) as u8);
@@ -703,11 +722,12 @@ pub fn serialize_playlist(repeats: &[u16]) -> (Vec<u8>, String) {
         bin.push(reps);
         bin.push(flags);
         txt.push_str(&format!(
-            "  0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x},  // {}: frames {}..{} x{}{}{}\n",
+            "  0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x},  // {}: frames {}..{} x{}{}{}{}\n",
             start & 0xFF, start >> 8, end & 0xFF, end >> 8, reps, flags,
             seg.name, segment_start(i), segment_start(i) + seg.len - 1, reps,
             if seg.loops { " [loop]" } else { "" },
-            if seg.color_pass { "" } else { " [no color pass]" }));
+            if seg.color_pass { "" } else { " [no color pass]" },
+            if seg.wipe_on_entry { " [wipe on entry]" } else { "" }));
     }
     txt.push_str("};\n");
 
@@ -784,10 +804,15 @@ pub fn build_colram_plan(
     let mut states = Vec::with_capacity(pres_map.len());
     let mut stamps = Vec::with_capacity(pres_map.len());
     let mut changed = Vec::with_capacity(pres_map.len());
+    let mut prev_seg = usize::MAX;
 
     for &pf in pres_map {
         let f = pf as usize;
         let (seg, _) = segment_at(f);
+        if seg != prev_seg && SEGMENTS[seg].wipe_on_entry {
+            ram.fill(COL_BASE); // one-shot wipe the player does at entry
+        }
+        prev_seg = seg;
         let mut st = 0usize;
         let mut ch = 0usize;
         if seg_colored.get(seg).copied().unwrap_or(false) {

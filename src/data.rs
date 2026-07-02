@@ -47,6 +47,9 @@ pub struct SegmentDef {
     /// the char layer (trail color rides on the sprite classes), so the
     /// player skips the pass there — that's where stamp counts peak.
     pub color_pass: bool,
+    /// Refill color RAM with the base color when this segment starts
+    /// (one-shot, replaces the per-frame pass as stale-color cleanup).
+    pub wipe_on_entry: bool,
 }
 
 pub const SEG_INTRO: usize = 0;
@@ -61,14 +64,15 @@ pub const SEG_EXIT: usize = 6;
 // frame % 25 == 13 (see above). Changing a length shifts all later segments —
 // keep loop boundaries in the dead zone.
 pub const SEGMENTS: [SegmentDef; 7] = [
-    SegmentDef { name: "intro",  len: 64,  loops: false, default_repeats: 1, color_pass: false },
-    SegmentDef { name: "xtend",  len: 64,  loops: false, default_repeats: 1, color_pass: false },
-    SegmentDef { name: "morph",  len: 35,  loops: false, default_repeats: 1, color_pass: true },
-    SegmentDef { name: "hold E", len: 75,  loops: true,  default_repeats: 4, color_pass: true },
-    SegmentDef { name: "pan",    len: 100, loops: false, default_repeats: 1, color_pass: true },
-    SegmentDef { name: "hold D", len: 75,  loops: true,  default_repeats: 6, color_pass: true },
-    // exit keeps the pass: it repaints mono purple over stale specular cells
-    SegmentDef { name: "exit",   len: 48,  loops: false, default_repeats: 1, color_pass: true },
+    SegmentDef { name: "intro",  len: 64,  loops: false, default_repeats: 1, color_pass: false, wipe_on_entry: false },
+    SegmentDef { name: "xtend",  len: 64,  loops: false, default_repeats: 1, color_pass: false, wipe_on_entry: false },
+    SegmentDef { name: "morph",  len: 35,  loops: false, default_repeats: 1, color_pass: true,  wipe_on_entry: false },
+    SegmentDef { name: "hold E", len: 75,  loops: true,  default_repeats: 4, color_pass: true,  wipe_on_entry: false },
+    SegmentDef { name: "pan",    len: 100, loops: false, default_repeats: 1, color_pass: true,  wipe_on_entry: false },
+    SegmentDef { name: "hold D", len: 75,  loops: true,  default_repeats: 6, color_pass: true,  wipe_on_entry: false },
+    // exit is mono like the other trails; the one-shot wipe at entry
+    // replaces the per-frame pass as stale-specular cleanup
+    SegmentDef { name: "exit",   len: 48,  loops: false, default_repeats: 1, color_pass: false, wipe_on_entry: true },
 ];
 
 /// First frame of segment `idx` (== total frames when idx == SEGMENTS.len()).

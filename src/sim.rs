@@ -1165,8 +1165,10 @@ pub fn allocate(positions: &[DiscPosition]) -> AllocResult {
                 let oy = vis[di].y;
 
                 for &(dx, dy) in &offsets {
-                    let ns = get_stamp_cells(ox + dx as f64, oy + dy as f64);
-                    if ns.is_empty() {
+                    // A nudge must not push the stamp into viewport clipping —
+                    // clipped stamps can't render as chars on the C64
+                    let (ns, clipped) = get_stamp_cells_with_clip(ox + dx as f64, oy + dy as f64);
+                    if ns.is_empty() || clipped {
                         continue;
                     }
                     let mut nc = 0i32;
