@@ -59,11 +59,11 @@ struct C64App {
     spec: data::SpecularParams,
 }
 
-/// Default color RAM usage: all segments colored. Writes only happen where a
-/// cell's shade differs from the purple base, so uniform segments cost ~0 —
-/// the per-segment toggles exist to A/B mono vs colored by eye.
+/// Default color RAM usage matches the exported playlist flags: the C64
+/// skips the color pass in trail segments (mono chars there). The toggles
+/// remain for A/B-ing by eye.
 fn default_seg_colored() -> Vec<bool> {
-    vec![true; data::SEGMENTS.len()]
+    data::SEGMENTS.iter().map(|s| s.color_pass).collect()
 }
 
 /// Expand the segment playlist into a presentation -> data frame map.

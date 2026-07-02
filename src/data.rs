@@ -38,6 +38,10 @@ pub struct SegmentDef {
     pub len: usize,
     pub loops: bool,
     pub default_repeats: u16,
+    /// Run the C64 color pass in this segment. Trail segments are mono on
+    /// the char layer (trail color rides on the sprite classes), so the
+    /// player skips the pass there — that's where stamp counts peak.
+    pub color_pass: bool,
 }
 
 pub const SEG_INTRO: usize = 0;
@@ -52,13 +56,14 @@ pub const SEG_EXIT: usize = 6;
 // frame % 25 == 13 (see above). Changing a length shifts all later segments —
 // keep loop boundaries in the dead zone.
 pub const SEGMENTS: [SegmentDef; 7] = [
-    SegmentDef { name: "intro",  len: 64,  loops: false, default_repeats: 1 },
-    SegmentDef { name: "xtend",  len: 64,  loops: false, default_repeats: 1 },
-    SegmentDef { name: "morph",  len: 35,  loops: false, default_repeats: 1 },
-    SegmentDef { name: "hold E", len: 75,  loops: true,  default_repeats: 4 },
-    SegmentDef { name: "pan",    len: 100, loops: false, default_repeats: 1 },
-    SegmentDef { name: "hold D", len: 75,  loops: true,  default_repeats: 6 },
-    SegmentDef { name: "exit",   len: 48,  loops: false, default_repeats: 1 },
+    SegmentDef { name: "intro",  len: 64,  loops: false, default_repeats: 1, color_pass: false },
+    SegmentDef { name: "xtend",  len: 64,  loops: false, default_repeats: 1, color_pass: false },
+    SegmentDef { name: "morph",  len: 35,  loops: false, default_repeats: 1, color_pass: true },
+    SegmentDef { name: "hold E", len: 75,  loops: true,  default_repeats: 4, color_pass: true },
+    SegmentDef { name: "pan",    len: 100, loops: false, default_repeats: 1, color_pass: true },
+    SegmentDef { name: "hold D", len: 75,  loops: true,  default_repeats: 6, color_pass: true },
+    // exit keeps the pass: it repaints mono purple over stale specular cells
+    SegmentDef { name: "exit",   len: 48,  loops: false, default_repeats: 1, color_pass: true },
 ];
 
 /// First frame of segment `idx` (== total frames when idx == SEGMENTS.len()).

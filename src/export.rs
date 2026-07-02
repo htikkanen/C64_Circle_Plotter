@@ -94,10 +94,10 @@ pub fn build_export_data(
                 } else {
                     (0, COL_BASE)
                 }
-            } else if shade_index(a, false, glitch_frame) <= 2 {
-                (0, COL_GHOST)
             } else {
-                (1, COL_BASE)
+                // trail segments: mono chars — the color pass is skipped
+                // there (playlist flag) and trail color rides on sprites
+                (0, COL_BASE)
             };
             let eff_z = if a.is_ghost { a.z + 10.0 + a.ghost_depth as f64 } else { a.z };
 
@@ -666,10 +666,11 @@ pub fn analyze_memory(prune_dist: f64, seq_frames: &[SeqFrame], spec: &SpecularP
 // are shared by stamps.bin and sprites.bin (both are indexed by z_frame).
 //
 //   Byte 0: entry_count
-//   Per entry (5 bytes):
+//   Per entry (6 bytes):
 //     start_lo, start_hi   z_frame offset of first frame   (start_frame * 2)
 //     end_lo,   end_hi     z_frame offset past last frame  (end_frame * 2)
 //     repeats              play count (0 = 256)
+//     flags                bit 0: skip the color pass in this segment
 
 pub fn serialize_playlist(repeats: &[u16]) -> (Vec<u8>, String) {
     let mut bin: Vec<u8> = Vec::new();
@@ -682,7 +683,8 @@ pub fn serialize_playlist(repeats: &[u16]) -> (Vec<u8>, String) {
     txt.push_str(&format!(
         "// C64 Playlist Export — {} entries, {} data frames, {} presented frames ({:.1}s at 50fps)\n",
         SEGMENTS.len(), TOTAL_FRAMES, total_pres, total_pres as f64 / FPS));
-    txt.push_str("// Per entry: [start_lo, start_hi] [end_lo, end_hi] [repeats] — offsets are frame*2\n\n");
+    txt.push_str("// Per entry: [start_lo, start_hi] [end_lo, end_hi] [repeats] [flags]\n");
+    txt.push_str("// offsets are frame*2; flags bit 0 = skip color pass\n\n");
     txt.push_str("const unsigned char playlist_data[] = {\n");
     txt.push_str(&format!("  0x{:02x},        // entry_count={}\n", SEGMENTS.len(), SEGMENTS.len()));
 
@@ -690,16 +692,19 @@ pub fn serialize_playlist(repeats: &[u16]) -> (Vec<u8>, String) {
         let start = (segment_start(i) * 2) as u16;
         let end = ((segment_start(i) + seg.len) * 2) as u16;
         let reps = if seg.loops { repeats[i].clamp(1, 255) as u8 } else { 1 };
+        let flags = if seg.color_pass { 0u8 } else { 1u8 };
         bin.push((start & 0xFF) as u8);
         bin.push((start >> 8) as u8);
         bin.push((end & 0xFF) as u8);
         bin.push((end >> 8) as u8);
         bin.push(reps);
+        bin.push(flags);
         txt.push_str(&format!(
-            "  0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x},  // {}: frames {}..{} x{}{}\n",
-            start & 0xFF, start >> 8, end & 0xFF, end >> 8, reps,
+            "  0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x},  // {}: frames {}..{} x{}{}{}\n",
+            start & 0xFF, start >> 8, end & 0xFF, end >> 8, reps, flags,
             seg.name, segment_start(i), segment_start(i) + seg.len - 1, reps,
-            if seg.loops { " [loop]" } else { "" }));
+            if seg.loops { " [loop]" } else { "" },
+            if seg.color_pass { "" } else { " [no color pass]" }));
     }
     txt.push_str("};\n");
 
